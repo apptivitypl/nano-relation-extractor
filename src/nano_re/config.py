@@ -87,8 +87,23 @@ class DataConfig:
     """Settings describing dataset retrieval and encoding.
 
     Attributes:
-        dataset_repo_id: Hugging Face dataset repository holding DocRED.
-        train_split: Split used for training, either annotated or distant.
+        languages: Languages in scope. Determines which corpus shards are read
+            and, through the vocabulary trimmer, how large the model ends up.
+        relation_corpus: Corpus supervising both heads.
+        entity_corpus: Corpus supervising the token head only. It exists because
+            the relation corpus alone provides far less entity supervision than
+            a multilingual tagger needs.
+        gold_eval_corpus: Human-filtered corpus used for evaluation. It covers
+            fewer languages than training does; the uncovered ones are reported
+            rather than silently scored against silver data.
+        relation_weight: Sampling weight of the relation corpus when
+            interleaving.
+        entity_weight: Sampling weight of the entity corpus.
+        min_relation_count: Smallest number of occurrences for a relation to
+            enter the label schema.
+        max_relations: Optional cap on the relation inventory, keeping the most
+            frequent. ``None`` keeps every relation meeting the minimum.
+        train_split: Split used for training.
         eval_split: Split used for evaluation.
         max_sequence_length: Maximum number of sub-word tokens per document.
         max_negative_pairs: Number of sampled negative entity pairs per training
@@ -98,11 +113,22 @@ class DataConfig:
         num_workers: Data loader worker processes.
         limit: Optional cap on the number of documents per split, used for smoke
             tests. ``None`` means no cap.
+        max_cached_documents: Largest split kept as encoded tensors between
+            epochs. Encoding costs roughly 68 KB per document, so the distantly
+            supervised split would hold about 7 GB; above this threshold
+            documents are re-encoded each epoch to bound memory instead.
         cache_dir: Directory for downloaded dataset files.
     """
 
-    dataset_repo_id: str = "thunlp/docred"
-    train_split: str = "train_annotated"
+    languages: tuple[str, ...] = ("pl", "en", "de", "fr", "es", "it", "nl", "pt")
+    relation_corpus: str = "sredfm"
+    entity_corpus: str = "multinerd"
+    gold_eval_corpus: str = "redfm"
+    relation_weight: float = 1.0
+    entity_weight: float = 1.0
+    min_relation_count: int = 1
+    max_relations: int | None = None
+    train_split: str = "train"
     eval_split: str = "dev"
     max_sequence_length: int = 512
     max_negative_pairs: int = 96
@@ -110,6 +136,7 @@ class DataConfig:
     eval_batch_size: int = 4
     num_workers: int = 0
     limit: int | None = None
+    max_cached_documents: int = 20000
     cache_dir: Path | None = None
 
     @classmethod
@@ -119,8 +146,25 @@ class DataConfig:
         Returns:
             A :class:`DataConfig` populated from ``NANO_RE_*`` variables.
         """
+        raw_languages = os.getenv("NANO_RE_LANGUAGES")
+        languages = (
+            tuple(part.strip() for part in raw_languages.split(",") if part.strip())
+            if raw_languages
+            else cls.languages
+        )
+        max_relations = _env_int("NANO_RE_MAX_RELATIONS", 0)
         return cls(
-            dataset_repo_id=_env_str("NANO_RE_DATASET_REPO_ID", cls.dataset_repo_id),
+            languages=languages,
+            relation_corpus=_env_str("NANO_RE_RELATION_CORPUS", cls.relation_corpus),
+            entity_corpus=_env_str("NANO_RE_ENTITY_CORPUS", cls.entity_corpus),
+            relation_weight=_env_float(
+                "NANO_RE_RELATION_WEIGHT", cls.relation_weight
+            ),
+            entity_weight=_env_float("NANO_RE_ENTITY_WEIGHT", cls.entity_weight),
+            min_relation_count=_env_int(
+                "NANO_RE_MIN_RELATION_COUNT", cls.min_relation_count
+            ),
+            max_relations=max_relations if max_relations > 0 else None,
             train_split=_env_str("NANO_RE_TRAIN_SPLIT", cls.train_split),
             eval_split=_env_str("NANO_RE_EVAL_SPLIT", cls.eval_split),
             max_sequence_length=_env_int(
@@ -132,6 +176,9 @@ class DataConfig:
             train_batch_size=_env_int("NANO_RE_TRAIN_BATCH_SIZE", cls.train_batch_size),
             eval_batch_size=_env_int("NANO_RE_EVAL_BATCH_SIZE", cls.eval_batch_size),
             num_workers=_env_int("NANO_RE_NUM_WORKERS", cls.num_workers),
+            max_cached_documents=_env_int(
+                "NANO_RE_MAX_CACHED_DOCUMENTS", cls.max_cached_documents
+            ),
         )
 
 
@@ -145,12 +192,23 @@ class ModelConfig:
         dropout: Dropout probability applied inside both task heads.
         entity_pooling: Strategy used to pool mention tokens into an entity
             vector. Only ``mean`` is currently implemented.
+        trim_vocabulary: Whether to compact the embedding table to the tokens
+            the configured languages actually use. The pretrained vocabulary
+            covers over a hundred languages and accounts for most of the
+            model's parameters, so this is the largest single lever on size.
+        vocabulary_coverage: Fraction of observed token occurrences the trimmed
+            vocabulary must still cover.
+        min_vocabulary_size: Floor on the trimmed vocabulary, guarding against a
+            small sample producing an unusably narrow table.
     """
 
     backbone_name: str = "nreimers/mMiniLMv2-L6-H384-distilled-from-XLMR-Large"
     pair_hidden_size: int = 512
     dropout: float = 0.1
     entity_pooling: str = "mean"
+    trim_vocabulary: bool = True
+    vocabulary_coverage: float = 0.9999
+    min_vocabulary_size: int = 8000
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
@@ -163,6 +221,15 @@ class ModelConfig:
             backbone_name=_env_str("NANO_RE_BACKBONE", cls.backbone_name),
             pair_hidden_size=_env_int("NANO_RE_PAIR_HIDDEN_SIZE", cls.pair_hidden_size),
             dropout=_env_float("NANO_RE_DROPOUT", cls.dropout),
+            trim_vocabulary=_env_bool(
+                "NANO_RE_TRIM_VOCABULARY", cls.trim_vocabulary
+            ),
+            vocabulary_coverage=_env_float(
+                "NANO_RE_VOCABULARY_COVERAGE", cls.vocabulary_coverage
+            ),
+            min_vocabulary_size=_env_int(
+                "NANO_RE_MIN_VOCABULARY_SIZE", cls.min_vocabulary_size
+            ),
         )
 
 
@@ -184,6 +251,11 @@ class TrainingConfig:
         relation_threshold: Sigmoid threshold used by the ``bce`` strategy.
         seed: Seed applied to Python, NumPy and PyTorch generators.
         output_dir: Directory receiving checkpoints and reports.
+        init_from: Bundle whose weights initialise this run instead of the
+            pretrained backbone and fresh heads. This is what chains the two
+            stages of a two-phase recipe: pretrain on the automatically
+            generated corpus, then fine-tune on a cleaner one from that
+            checkpoint.
     """
 
     epochs: int = 3
@@ -199,6 +271,7 @@ class TrainingConfig:
     relation_threshold: float = 0.5
     seed: int = 42
     output_dir: Path = Path("artifacts")
+    init_from: Path | None = None
 
     @classmethod
     def from_env(cls) -> "TrainingConfig":
@@ -226,6 +299,11 @@ class TrainingConfig:
             relation_loss=_env_str("NANO_RE_RELATION_LOSS", cls.relation_loss),
             seed=_env_int("NANO_RE_SEED", cls.seed),
             output_dir=Path(_env_str("NANO_RE_OUTPUT_DIR", str(cls.output_dir))),
+            init_from=(
+                Path(os.environ["NANO_RE_INIT_FROM"])
+                if os.getenv("NANO_RE_INIT_FROM")
+                else None
+            ),
         )
 
 

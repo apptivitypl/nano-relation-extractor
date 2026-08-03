@@ -292,27 +292,30 @@ class MultiTaskTrainer:
         accumulation = max(1, self._config.gradient_accumulation_steps)
         totals = [0.0, 0.0, 0.0]
         num_batches = 0
+        pending = 0
         optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(loader, start=1):
-            batch = batch.to(device)
-            with self._device_manager.autocast():
-                outputs = self._model(**batch.model_inputs())
-                losses = self._criterion(
-                    ner_logits=outputs.ner_logits,
-                    ner_labels=batch.ner_labels,
-                    relation_logits=outputs.relation_logits,
-                    relation_labels=batch.relation_labels,
-                    pair_mask=batch.pair_mask,
-                )
-            scaler.scale(losses.total / accumulation).backward()
+            if batch is not None:
+                batch = batch.to(device)
+                with self._device_manager.autocast():
+                    outputs = self._model(**batch.model_inputs())
+                    losses = self._criterion(
+                        ner_logits=outputs.ner_logits,
+                        ner_labels=batch.ner_labels,
+                        relation_logits=outputs.relation_logits,
+                        relation_labels=batch.relation_labels,
+                        pair_mask=batch.pair_mask,
+                    )
+                scaler.scale(losses.total / accumulation).backward()
 
-            totals[0] += float(losses.total.item())
-            totals[1] += float(losses.ner.item())
-            totals[2] += float(losses.relation.item())
-            num_batches += 1
+                totals[0] += float(losses.total.item())
+                totals[1] += float(losses.ner.item())
+                totals[2] += float(losses.relation.item())
+                num_batches += 1
+                pending += 1
 
-            if step % accumulation == 0 or step == len(loader):
+            if pending and (step % accumulation == 0 or step == len(loader)):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self._model.parameters(), self._config.max_grad_norm
@@ -321,6 +324,7 @@ class MultiTaskTrainer:
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                pending = 0
 
         divisor = max(1, num_batches)
         return (totals[0] / divisor, totals[1] / divisor, totals[2] / divisor)
@@ -337,4 +341,7 @@ def _serialisable_config(config: TrainingConfig) -> dict[str, object]:
     """
     payload = asdict(config)
     payload["output_dir"] = str(payload["output_dir"])
+    payload["init_from"] = (
+        str(payload["init_from"]) if payload["init_from"] is not None else None
+    )
     return payload

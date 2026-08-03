@@ -7,7 +7,7 @@ come from, so replacing the backbone or either head requires no edit here.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import torch
 from torch import nn
@@ -28,6 +28,10 @@ class NanoREArchitecture:
         num_relation_labels: Width of the relation head, including ``NA``.
         pair_hidden_size: Width of the relation head's hidden layer.
         dropout: Dropout probability used in both heads.
+        vocab_size: Embedding rows, which differ from the pretrained vocabulary
+            once trimming has run.
+        original_vocab_size: Size of the identifier lookup table, ``None`` when
+            the vocabulary was never trimmed.
     """
 
     backbone_name: str
@@ -36,6 +40,8 @@ class NanoREArchitecture:
     num_relation_labels: int
     pair_hidden_size: int
     dropout: float
+    vocab_size: int | None = None
+    original_vocab_size: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON compatible representation of the architecture."""
@@ -58,6 +64,16 @@ class NanoREArchitecture:
             num_relation_labels=int(payload["num_relation_labels"]),
             pair_hidden_size=int(payload["pair_hidden_size"]),
             dropout=float(payload["dropout"]),
+            vocab_size=(
+                int(payload["vocab_size"])
+                if payload.get("vocab_size") is not None
+                else None
+            ),
+            original_vocab_size=(
+                int(payload["original_vocab_size"])
+                if payload.get("original_vocab_size") is not None
+                else None
+            ),
         )
 
 
@@ -89,8 +105,19 @@ class NanoREModel(nn.Module):
 
     @property
     def architecture(self) -> NanoREArchitecture:
-        """Description required to rebuild this model from a checkpoint."""
-        return self._architecture
+        """Description required to rebuild this model from a checkpoint.
+
+        The vocabulary fields are read from the backbone on every access rather
+        than captured at construction, because trimming replaces the embedding
+        table after the model is assembled. A description recorded once would
+        still name the pretrained vocabulary and the checkpoint would refuse to
+        load.
+        """
+        return replace(
+            self._architecture,
+            vocab_size=int(self.backbone.encoder.config.vocab_size),
+            original_vocab_size=self.backbone.original_vocab_size,
+        )
 
     def forward(
         self,

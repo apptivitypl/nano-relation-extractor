@@ -37,6 +37,11 @@ class EncodedDocument:
             map predictions back onto gold triples.
         dropped_relations: Gold triples lost because an endpoint was truncated
             away. Reported so the recall ceiling stays visible.
+        has_relation_supervision: Whether the source corpus annotates relations.
+            A corpus that only annotates entities must not teach the relation
+            head that every pair is ``NA``, so this flag travels with the tensors
+            into the collator and from there into the loss.
+        language: Language of the source document, used in reporting.
     """
 
     doc_id: str
@@ -49,6 +54,8 @@ class EncodedDocument:
     entity_types: tuple[str, ...]
     source_entity_ids: tuple[int, ...]
     dropped_relations: int = 0
+    has_relation_supervision: bool = True
+    language: str = ""
 
     @property
     def num_entities(self) -> int:
@@ -116,7 +123,7 @@ class DocumentEncoder:
             The encoded document, or ``None`` when fewer than two entities
             survive truncation and no relation could ever be predicted.
         """
-        if not document.words:
+        if not document.words or not document.entities:
             return None
 
         encoding = self._tokenizer(
@@ -136,7 +143,10 @@ class DocumentEncoder:
         kept_entities, source_entity_ids = self._select_entities(
             document, word_to_subwords
         )
-        if len(kept_entities) < 2:
+        supervises_relations = document.has_labels
+        if supervises_relations and len(kept_entities) < 2:
+            return None
+        if not kept_entities:
             return None
 
         mention_mask = self._build_mention_mask(
@@ -160,6 +170,8 @@ class DocumentEncoder:
             ),
             source_entity_ids=tuple(source_entity_ids),
             dropped_relations=dropped,
+            has_relation_supervision=supervises_relations,
+            language=document.metadata.get("language", ""),
         )
 
     def encode_all(

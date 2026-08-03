@@ -1,7 +1,12 @@
 """Composition root for the data pipeline.
 
-The module wires source, parser, encoder and collator together and is the only
+The module builds corpora, the label schema and the loaders, and is the only
 data component the notebook or CLI needs to touch.
+
+The label schema is derived from the corpora rather than declared up front. Which
+relations exist depends on which languages are in scope, so the inventory is
+counted during a first pass and then frozen into the bundle, where inference and
+the model card read the same file the heads were sized from.
 """
 
 from __future__ import annotations
@@ -12,65 +17,53 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from ..config import DataConfig, ModelConfig
-from ..schema import LabelSchema
+from ..schema import LabelSchema, RelationInventory
 from .collator import MultiTaskCollator
-from .document import Document
-from .encoder import DocumentEncoder, EncodedDocument
-from .parser import DocRedParser
-from .source import DocREDHubSource, DocumentSource
+from .encoder import DocumentEncoder
+from .multi_corpus import CorpusSpec, CorpusStatistics, MultiCorpusDataset
+from .parsers import MultiNerdParser, SredfmParser
+from .sources import MultiNerdSource, RedfmSource, SredfmSource
 
 
 @dataclass(frozen=True)
-class SplitStatistics:
-    """Counters describing what a split contributed after encoding.
+class CorpusBundle:
+    """A dataset together with the counters describing how it was built.
 
     Attributes:
-        split: Split name.
-        raw_documents: Records downloaded from the corpus.
-        encoded_documents: Records that produced usable tensors.
-        gold_triples: Gold relation triples retained after truncation.
-        dropped_triples: Gold triples lost because an endpoint was truncated.
+        dataset: The interleaved, lazily encoding dataset.
+        statistics: Per-corpus counters.
     """
 
-    split: str
-    raw_documents: int
-    encoded_documents: int
-    gold_triples: int
-    dropped_triples: int
+    dataset: MultiCorpusDataset
+    statistics: tuple[CorpusStatistics, ...]
 
-    @property
-    def recall_ceiling(self) -> float:
-        """Maximum achievable relation recall given truncation losses."""
-        total = self.gold_triples + self.dropped_triples
-        return self.gold_triples / total if total else 1.0
+    def describe(self) -> str:
+        """Return a human readable summary of every contributing corpus."""
+        lines = [f"Strumien: {len(self.dataset)} dokumentow"]
+        lines.extend(item.describe() for item in self.statistics)
+        return "\n".join(lines)
 
 
 class DataModule:
     """Builds tokenizer, schema and data loaders from configuration.
 
     Args:
-        data_config: Dataset and encoding settings.
+        data_config: Corpus, language and encoding settings.
         model_config: Provides the backbone name used to select the tokenizer.
-        source: Corpus reader. Defaults to a DocRED Hub reader.
     """
 
-    def __init__(
-        self,
-        data_config: DataConfig,
-        model_config: ModelConfig,
-        source: DocumentSource | None = None,
-    ) -> None:
+    def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
         self._data_config = data_config
         self._model_config = model_config
-        self._source = source or DocREDHubSource(
-            repo_id=data_config.dataset_repo_id,
-            cache_dir=data_config.cache_dir,
-        )
-        self._parser = DocRedParser()
         self._tokenizer: PreTrainedTokenizerBase | None = None
         self._schema: LabelSchema | None = None
         self._encoder: DocumentEncoder | None = None
-        self._statistics: dict[str, SplitStatistics] = {}
+        self._inventory = RelationInventory()
+
+    @property
+    def languages(self) -> tuple[str, ...]:
+        """Languages this module reads."""
+        return self._data_config.languages
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
@@ -82,13 +75,40 @@ class DataModule:
         return self._tokenizer
 
     @property
+    def inventory(self) -> RelationInventory:
+        """Relation counts accumulated while parsing."""
+        return self._inventory
+
+    @property
     def schema(self) -> LabelSchema:
-        """Label vocabularies derived from the corpus relation inventory."""
+        """Label schema, built from the corpora on first access.
+
+        Raises:
+            RuntimeError: If no relation has been seen yet, which means the
+                corpora were never read.
+        """
         if self._schema is None:
-            self._schema = LabelSchema.from_relation_info(
-                self._source.load_relation_info()
+            if not len(self._inventory):
+                raise RuntimeError(
+                    "The relation inventory is empty. Build a training corpus "
+                    "before requesting the schema."
+                )
+            self._schema = self._inventory.to_schema(
+                languages=self._data_config.languages,
+                min_count=self._data_config.min_relation_count,
+                max_relations=self._data_config.max_relations,
             )
         return self._schema
+
+    def set_schema(self, schema: LabelSchema) -> None:
+        """Adopt an existing schema instead of deriving one.
+
+        Args:
+            schema: Schema loaded from a bundle, so that a later stage sizes its
+                heads exactly as the trained checkpoint did.
+        """
+        self._schema = schema
+        self._encoder = None
 
     @property
     def encoder(self) -> DocumentEncoder:
@@ -102,81 +122,115 @@ class DataModule:
             )
         return self._encoder
 
-    @property
-    def statistics(self) -> dict[str, SplitStatistics]:
-        """Per-split counters gathered during the most recent encoding."""
-        return dict(self._statistics)
-
-    def load_documents(self, split: str) -> list[Document]:
-        """Download and parse a split into documents.
+    def build_relation_source(self, gold: bool = False):
+        """Create the reader for the relation corpus.
 
         Args:
-            split: Split name understood by the configured source.
+            gold: Whether to build the human-filtered evaluation corpus instead
+                of the automatically generated training corpus.
 
         Returns:
-            The parsed documents.
+            The configured reader.
         """
-        raw = self._source.load_split(split, limit=self._data_config.limit)
-        return self._parser.parse_all(raw)
+        if gold:
+            return RedfmSource(languages=self._data_config.languages)
+        return SredfmSource(languages=self._data_config.languages)
 
-    def encode_split(self, split: str, training: bool) -> list[EncodedDocument]:
-        """Download, parse and encode a split, recording statistics.
-
-        Args:
-            split: Split name understood by the configured source.
-            training: When ``True`` negative pairs are subsampled.
+    def build_entity_source(self):
+        """Create the reader for the entity-only corpus.
 
         Returns:
-            The encoded documents.
+            The configured reader.
         """
-        documents = self.load_documents(split)
-        encoded = self.encoder.encode_all(documents, sample_negatives=training)
-        gold = sum(
-            int(item.relation_labels[:, 1:].sum().item()) for item in encoded
-        )
-        self._statistics[split] = SplitStatistics(
-            split=split,
-            raw_documents=len(documents),
-            encoded_documents=len(encoded),
-            gold_triples=gold,
-            dropped_triples=sum(item.dropped_relations for item in encoded),
-        )
-        return encoded
+        return MultiNerdSource(languages=self._data_config.languages)
 
-    def build_loader(
-        self, documents: list[EncodedDocument], batch_size: int, shuffle: bool
-    ) -> DataLoader:
-        """Wrap encoded documents in a data loader.
+    def build_corpus(
+        self, split: str, training: bool, gold: bool = False
+    ) -> CorpusBundle:
+        """Build an interleaved dataset for one split.
+
+        Parsing happens here, which is also when the relation inventory grows.
+        A schema derived afterwards therefore reflects exactly the data the
+        model will be trained on.
 
         Args:
-            documents: Encoded documents to iterate.
+            split: Split name passed to every reader.
+            training: When ``True`` negative pairs are subsampled and the entity
+                corpus is included. Evaluation uses the relation corpus alone,
+                since a corpus without relations cannot score the relation head.
+            gold: Whether to read the human-filtered relation corpus.
+
+        Returns:
+            The dataset and its per-corpus counters.
+        """
+        limit = self._data_config.limit
+        specs = [
+            CorpusSpec(
+                name=self._data_config.relation_corpus,
+                source=self.build_relation_source(gold=gold),
+                parser=SredfmParser(inventory=self._inventory),
+                split=split,
+                weight=self._data_config.relation_weight,
+                limit=limit,
+            )
+        ]
+        if training and self._data_config.entity_weight > 0:
+            specs.append(
+                CorpusSpec(
+                    name=self._data_config.entity_corpus,
+                    source=self.build_entity_source(),
+                    parser=MultiNerdParser(),
+                    split=split if split != "dev" else "test",
+                    weight=self._data_config.entity_weight,
+                    limit=limit,
+                )
+            )
+
+        dataset = MultiCorpusDataset(
+            specs=specs,
+            encoder_factory=lambda: self.encoder,
+            sample_negatives=training,
+            cache=self._should_cache(specs, limit),
+        )
+        return CorpusBundle(
+            dataset=dataset, statistics=tuple(dataset.statistics)
+        )
+
+    def build_loader(self, dataset, batch_size: int, shuffle: bool) -> DataLoader:
+        """Wrap a dataset in a data loader.
+
+        Args:
+            dataset: Dataset yielding encoded documents or ``None``.
             batch_size: Documents per batch.
             shuffle: Whether to shuffle between epochs.
 
         Returns:
             A configured :class:`torch.utils.data.DataLoader`.
+
+        Raises:
+            ValueError: If the tokenizer defines no padding token.
         """
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             raise ValueError("Tokenizer does not define a padding token.")
         return DataLoader(
-            documents,
+            dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=self._data_config.num_workers,
             collate_fn=MultiTaskCollator(pad_token_id=pad_token_id),
         )
 
-    def train_loader(self) -> DataLoader:
-        """Build the training loader for the configured training split."""
-        encoded = self.encode_split(self._data_config.train_split, training=True)
-        return self.build_loader(
-            encoded, self._data_config.train_batch_size, shuffle=True
-        )
+    def _should_cache(self, specs: list[CorpusSpec], limit: int | None) -> bool:
+        """Decide whether encoded tensors may be retained between epochs.
 
-    def eval_loader(self) -> DataLoader:
-        """Build the evaluation loader for the configured evaluation split."""
-        encoded = self.encode_split(self._data_config.eval_split, training=False)
-        return self.build_loader(
-            encoded, self._data_config.eval_batch_size, shuffle=False
-        )
+        Args:
+            specs: Corpora contributing to the stream.
+            limit: Per-corpus record cap, when one is configured.
+
+        Returns:
+            ``True`` when the stream is small enough to cache.
+        """
+        if limit is None:
+            return False
+        return limit * len(specs) <= self._data_config.max_cached_documents

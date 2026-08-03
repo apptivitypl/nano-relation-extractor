@@ -5,8 +5,8 @@ own: data acquisition and encoding, model assembly, multi-task training, ONNX
 export with INT8 quantisation, and assembly of a self-contained local bundle.
 
 Nothing is ever uploaded and no credential is required. The Hugging Face Hub is
-used only to download the public DocRED corpus and the public pretrained
-encoder.
+used only to download the public multilingual corpora and the public
+pretrained encoder.
 """
 
 from .config import (

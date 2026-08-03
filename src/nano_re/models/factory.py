@@ -43,6 +43,8 @@ class NanoREModelFactory:
             num_relation_labels=schema.num_relation_labels,
             pair_hidden_size=model_config.pair_hidden_size,
             dropout=model_config.dropout,
+            vocab_size=int(backbone.encoder.config.vocab_size),
+            original_vocab_size=backbone.original_vocab_size,
         )
         return self._assemble(backbone, architecture)
 
@@ -67,7 +69,11 @@ class NanoREModelFactory:
             )
         payload = json.loads(architecture_path.read_text(encoding="utf-8"))
         architecture = NanoREArchitecture.from_dict(payload)
-        backbone = EncoderBackbone.from_config(architecture.backbone_name)
+        backbone = EncoderBackbone.from_config(
+            architecture.backbone_name,
+            vocab_size=architecture.vocab_size,
+            original_vocab_size=architecture.original_vocab_size,
+        )
         model = self._assemble(backbone, architecture)
         model.load_state_dict(load_file(str(weights_path)))
         model.eval()

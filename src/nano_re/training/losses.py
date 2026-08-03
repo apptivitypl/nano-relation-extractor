@@ -70,6 +70,20 @@ class RelationObjective(Protocol):
         """
         ...
 
+    def confidence(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert relation scores into per-class confidences.
+
+        The confidence must be consistent with :meth:`decode`: a class predicted
+        by ``decode`` scores above ``0.5`` here, and one rejected scores below.
+
+        Args:
+            logits: Relation scores, shape ``[B, P, R]``.
+
+        Returns:
+            A float tensor of shape ``[B, P, R]`` with values in ``(0, 1)``.
+        """
+        ...
+
 
 class AdaptiveThresholdLoss(nn.Module):
     """Adaptive thresholding objective for multi-label relation extraction.
@@ -145,6 +159,18 @@ class AdaptiveThresholdLoss(nn.Module):
         predictions[..., 0] = False
         return predictions
 
+    def confidence(self, logits: torch.Tensor) -> torch.Tensor:
+        """Score each class by how far it sits above the learned threshold.
+
+        Args:
+            logits: Relation scores, shape ``[B, P, R]``.
+
+        Returns:
+            Confidences of shape ``[B, P, R]``, crossing ``0.5`` exactly where
+            :meth:`decode` flips.
+        """
+        return torch.sigmoid(logits - logits[..., 0:1])
+
 
 class BinaryRelationLoss(nn.Module):
     """Binary cross entropy objective with a fixed probability threshold.
@@ -159,7 +185,9 @@ class BinaryRelationLoss(nn.Module):
             counteracts the sparsity of gold relations.
     """
 
-    def __init__(self, threshold: float = 0.5, positive_weight: float | None = None) -> None:
+    def __init__(
+        self, threshold: float = 0.5, positive_weight: float | None = None
+    ) -> None:
         super().__init__()
         self.threshold = threshold
         self._positive_weight = positive_weight
@@ -217,6 +245,25 @@ class BinaryRelationLoss(nn.Module):
         predictions = torch.sigmoid(logits) > self.threshold
         predictions[..., 0] = False
         return predictions
+
+    def confidence(self, logits: torch.Tensor) -> torch.Tensor:
+        """Score each class by its probability rescaled around the threshold.
+
+        Rescaling keeps the confidence crossing ``0.5`` exactly where
+        :meth:`decode` flips, whatever threshold was tuned.
+
+        Args:
+            logits: Relation scores, shape ``[B, P, R]``.
+
+        Returns:
+            Confidences of shape ``[B, P, R]``.
+        """
+        probabilities = torch.sigmoid(logits)
+        below = 0.5 * probabilities / max(self.threshold, 1e-6)
+        above = 0.5 + 0.5 * (probabilities - self.threshold) / max(
+            1.0 - self.threshold, 1e-6
+        )
+        return torch.where(probabilities <= self.threshold, below, above)
 
 
 class MultiTaskLoss(nn.Module):

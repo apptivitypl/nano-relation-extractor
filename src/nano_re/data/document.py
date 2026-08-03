@@ -1,6 +1,6 @@
 """Dataset agnostic document representation.
 
-These structures decouple every downstream stage from the DocRED JSON layout.
+These structures decouple every downstream stage from any corpus's layout.
 Supporting another corpus means writing a new parser that emits :class:`Document`
 objects; the encoder, model and metrics stay untouched.
 """

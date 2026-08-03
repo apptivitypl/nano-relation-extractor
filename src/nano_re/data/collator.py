@@ -25,7 +25,12 @@ class MultiTaskBatch:
         mention_mask: Entity pooling weights, shape ``[B, E, S]``.
         entity_mask: Validity flag per entity slot, shape ``[B, E]``.
         pair_index: Head and tail entity rows per pair, shape ``[B, P, 2]``.
-        pair_mask: Validity flag per pair slot, shape ``[B, P]``.
+        pair_mask: Validity flag per pair slot, shape ``[B, P]``. A document from
+            a corpus that annotates entities but not relations carries zeros
+            across the whole row. Because both the relation loss and the
+            relation metric already select on this mask, that single assignment
+            is what keeps an entity-only corpus from teaching the relation head
+            that every pair is ``NA``.
         relation_labels: Multi-hot relation targets, shape ``[B, P, R]``.
         doc_ids: Source document identifier per batch element.
         source_entity_ids: Original entity indices per batch element, used to
@@ -91,15 +96,26 @@ class MultiTaskCollator:
         self._pad_token_id = pad_token_id
         self._label_pad_id = label_pad_id
 
-    def __call__(self, documents: list[EncodedDocument]) -> MultiTaskBatch:
+    def __call__(
+        self, documents: list[EncodedDocument | None]
+    ) -> MultiTaskBatch | None:
         """Collate a list of encoded documents.
 
+        Lazy encoding yields ``None`` for documents that cannot produce a
+        relation. They are dropped here so no caller has to pre-filter, and a
+        batch that loses every member becomes ``None`` rather than an empty
+        tensor set that downstream code would have to special-case anyway.
+
         Args:
-            documents: Encoded documents belonging to one batch.
+            documents: Encoded documents belonging to one batch, possibly
+                containing ``None`` placeholders.
 
         Returns:
-            The padded batch.
+            The padded batch, or ``None`` when nothing usable remains.
         """
+        documents = [item for item in documents if item is not None]
+        if not documents:
+            return None
         batch_size = len(documents)
         max_sequence = max(int(item.input_ids.shape[0]) for item in documents)
         max_entities = max(item.num_entities for item in documents)
@@ -134,8 +150,9 @@ class MultiTaskCollator:
             mention_mask[row, :entities, :sequence] = item.mention_mask
             entity_mask[row, :entities] = 1.0
             pair_index[row, :pairs] = item.pair_index
-            pair_mask[row, :pairs] = 1.0
             relation_labels[row, :pairs] = item.relation_labels
+            if item.has_relation_supervision:
+                pair_mask[row, :pairs] = 1.0
 
         return MultiTaskBatch(
             input_ids=input_ids,

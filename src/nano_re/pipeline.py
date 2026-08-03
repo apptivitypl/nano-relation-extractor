@@ -26,6 +26,7 @@ from .export import (
 )
 from .artifacts import BundleAssembler, BundleReport, ModelCardBuilder
 from .models import NanoREModelFactory, count_parameters
+from .models.vocabulary import VocabularyTrimmer
 from .schema import LabelSchema
 from .training import (
     DeviceManager,
@@ -126,31 +127,32 @@ class Pipeline:
         return self._data_module
 
     def prepare(self) -> LabelSchema:
-        """Download the corpus, derive the label schema and report statistics.
+        """Read the corpora, derive the label schema and report statistics.
 
         Returns:
             The label schema, also written to the artifact directory.
         """
         module = self.data_module
+        self._report(f"Jezyki: {', '.join(module.languages)}")
+        bundle = module.build_corpus(self._config.data.train_split, training=True)
+        self._report(bundle.describe())
+
         schema = module.schema
+        counts = module.inventory.counts
+        rare = sum(1 for count in counts.values() if count < 10)
         self._report(
-            f"Label schema: {schema.num_bio_labels} BIO tags, "
-            f"{schema.num_relation_labels} relation classes."
+            f"Schemat: {schema.num_bio_labels} tagow BIO, "
+            f"{schema.num_relation_labels} klas relacji "
+            f"(z {len(counts)} zaobserwowanych predykatow, {rare} ponizej 10 wystapien)."
         )
-        encoded = module.encode_split(self._config.data.eval_split, training=False)
-        statistics = module.statistics[self._config.data.eval_split]
-        self._report(
-            f"Split {statistics.split}: {statistics.encoded_documents} of "
-            f"{statistics.raw_documents} documents encoded, "
-            f"{statistics.gold_triples} gold triples, recall ceiling "
-            f"{statistics.recall_ceiling:.4f}."
-        )
-        if encoded:
-            sample = encoded[0]
-            self._report(
-                f"First document: {sample.input_ids.shape[0]} tokens, "
-                f"{sample.num_entities} entities, {sample.num_pairs} candidate pairs."
-            )
+        for index in range(min(len(bundle.dataset), 50)):
+            sample = bundle.dataset[index]
+            if sample is not None:
+                self._report(
+                    f"Pierwszy dokument: {sample.input_ids.shape[0]} subwordow, "
+                    f"{sample.num_entities} encji, {sample.num_pairs} par kandydujacych."
+                )
+                break
         schema.save(self.artifacts_dir / SCHEMA_FILENAME)
         return schema
 
@@ -161,13 +163,23 @@ class Pipeline:
             The training report, also written to the artifact directory.
         """
         module = self.data_module
+        train_bundle = module.build_corpus(
+            self._config.data.train_split, training=True
+        )
+        eval_bundle = module.build_corpus(
+            self._config.data.eval_split, training=False
+        )
+        self._report(train_bundle.describe())
+        self._report(eval_bundle.describe())
+
         schema = module.schema
         schema.save(self.artifacts_dir / SCHEMA_FILENAME)
 
-        model = self._factory.build(self._config.model, schema)
+        model = self._build_model(schema)
         self._report(
-            f"Model assembled: {count_parameters(model) / 1e6:.1f}M parameters."
+            f"Model zlozony: {count_parameters(model) / 1e6:.1f}M parametrow."
         )
+        self._trim_vocabulary(model, module, train_bundle)
 
         objective = build_relation_objective(
             self._config.training.relation_loss,
@@ -181,13 +193,14 @@ class Pipeline:
         device_manager = DeviceManager()
         self._report(f"Device: {device_manager.describe()}.")
 
-        train_loader = module.train_loader()
-        eval_loader = module.eval_loader()
-        for statistics in module.statistics.values():
-            self._report(
-                f"Split {statistics.split}: {statistics.encoded_documents} documents, "
-                f"{statistics.gold_triples} gold triples."
-            )
+        train_loader = module.build_loader(
+            train_bundle.dataset,
+            self._config.data.train_batch_size,
+            shuffle=True,
+        )
+        eval_loader = module.build_loader(
+            eval_bundle.dataset, self._config.data.eval_batch_size, shuffle=False
+        )
 
         trainer = MultiTaskTrainer(
             model=model,
@@ -221,10 +234,12 @@ class Pipeline:
         int8_path = self.artifacts_dir / self._config.export.int8_filename
 
         export_report = OnnxExporter(self._config.export).export(model, fp32_path)
+        deviation = max(
+            export_report.max_ner_deviation, export_report.max_relation_deviation
+        )
         self._report(
             f"Exported with the {export_report.exporter} backend at opset "
-            f"{export_report.opset_version}; maximum deviation "
-            f"{max(export_report.max_ner_deviation, export_report.max_relation_deviation):.2e}."
+            f"{export_report.opset_version}; maximum deviation {deviation:.2e}."
         )
 
         quantization = DynamicInt8Quantizer(self._config.export).quantize(
@@ -252,7 +267,18 @@ class Pipeline:
             The benchmark report, also written to the artifact directory.
         """
         module = self.data_module
-        documents = module.encode_split(self._config.data.eval_split, training=False)
+        module.set_schema(LabelSchema.load(self.artifacts_dir / SCHEMA_FILENAME))
+        bundle = module.build_corpus(self._config.data.eval_split, training=False)
+        documents = [
+            encoded
+            for encoded in (
+                bundle.dataset[index]
+                for index in range(
+                    min(len(bundle.dataset), self._config.export.benchmark_documents)
+                )
+            )
+            if encoded is not None
+        ]
         fp32_path = self.artifacts_dir / self._config.export.fp32_filename
         int8_path = self.artifacts_dir / self._config.export.int8_filename
 
@@ -321,7 +347,10 @@ class Pipeline:
         schema = LabelSchema.load(self.artifacts_dir / SCHEMA_FILENAME)
         builder = ModelCardBuilder(
             config=self._config.packaging,
-            dataset_repo_id=self._config.data.dataset_repo_id,
+            corpora=(
+                self._config.data.relation_corpus,
+                self._config.data.entity_corpus,
+            ),
         )
         card = builder.build(
             schema=schema,
@@ -363,6 +392,67 @@ class Pipeline:
             quantization=artifacts.quantization,
         )
 
+    def _trim_vocabulary(self, model, module, bundle) -> None:
+        """Compact the embedding table to the languages actually in scope.
+
+        Trimming runs before training rather than after, so the retained rows
+        are the ones that receive gradients. Doing it afterwards would leave the
+        kept embeddings tuned for a vocabulary that no longer exists.
+
+        Args:
+            model: Model whose backbone is trimmed in place.
+            module: Data module supplying the tokenizer.
+            bundle: Training corpus whose documents define the token counts.
+        """
+        if not self._config.model.trim_vocabulary:
+            return
+        trimmer = VocabularyTrimmer(
+            tokenizer=module.tokenizer,
+            target_coverage=self._config.model.vocabulary_coverage,
+            min_vocab_size=self._config.model.min_vocabulary_size,
+        )
+        trimmer.observe_documents(bundle.dataset.documents)
+        report = trimmer.trim(model.backbone)
+        self._report(report.describe())
+        self._report(
+            f"Model po przycieciu: {count_parameters(model) / 1e6:.1f}M parametrow."
+        )
+
+    def _build_model(self, schema: LabelSchema):
+        """Assemble the model, optionally resuming from an earlier stage.
+
+        Args:
+            schema: Label vocabularies determining both head widths.
+
+        Returns:
+            A freshly assembled model, or one restored from ``init_from``.
+
+        Raises:
+            FileNotFoundError: If ``init_from`` names a directory with no
+                checkpoint.
+            ValueError: If the checkpoint's relation vocabulary does not match
+                the current schema, which would silently mis-map every label.
+        """
+        init_from = self._config.training.init_from
+        if init_from is None:
+            return self._factory.build(self._config.model, schema)
+
+        model = self._factory.load(Path(init_from))
+        architecture = model.architecture
+        if architecture.num_relation_labels != schema.num_relation_labels or (
+            architecture.num_bio_labels != schema.num_bio_labels
+        ):
+            raise ValueError(
+                f"Checkpoint at {init_from} has "
+                f"{architecture.num_bio_labels} BIO and "
+                f"{architecture.num_relation_labels} relation labels, but the "
+                f"current schema has {schema.num_bio_labels} and "
+                f"{schema.num_relation_labels}. Both stages must use the same "
+                "label schema."
+            )
+        self._report(f"Initialised from the checkpoint at {init_from}.")
+        return model
+
     def _load_training_report(self) -> TrainingReport:
         """Read the training report written by the training stage.
 
@@ -399,6 +489,7 @@ class Pipeline:
             ner_weight=self._config.training.ner_loss_weight,
             relation_weight=self._config.training.relation_loss_weight,
         )
+        schema = module.schema
         device_manager = DeviceManager(preference="cpu", use_amp=False)
         adapter = OnnxModelAdapter(
             OnnxInferenceSession(
@@ -409,7 +500,7 @@ class Pipeline:
         loader = module.build_loader(
             documents, self._config.data.eval_batch_size, shuffle=False
         )
-        evaluator = MultiTaskEvaluator(module.schema, criterion, device_manager)
+        evaluator = MultiTaskEvaluator(schema, criterion, device_manager)
         return evaluator.evaluate(adapter, loader)
 
     def _log_epoch(self, epoch) -> None:

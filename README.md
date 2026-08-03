@@ -99,6 +99,70 @@ uv run nano-re all --limit 12 --epochs 1 --train-split dev --eval-split dev
 
 `notebooks/train_quantize_package.ipynb` drives the same stages cell by cell.
 
+## Using the trained model
+
+Once a bundle exists, `extract` runs it over your own text. With no input
+argument it starts an interactive session: paste text, press Enter on an empty
+line, get the extraction. Ctrl-D quits.
+
+```bash
+uv run nano-re extract
+```
+
+```bash
+uv run nano-re extract --text "Skai TV is a Greek television network based in Piraeus."
+```
+
+```bash
+uv run nano-re extract --file article.txt --json
+```
+
+Text also arrives over a pipe, which makes the command scriptable:
+
+```bash
+cat article.txt | uv run nano-re extract --json --top-k 20
+```
+
+Output:
+
+```
+Entities (3)
+  [0] ORG   Skai TV  x2
+  [1] LOC   Greek
+  [2] LOC   Piraeus
+
+Relations (2)
+  Skai TV --[country]--> Greek   (0.91)
+  Skai TV --[headquarters location]--> Piraeus   (0.87)
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--backend` | `onnx-int8` (default), `onnx-fp32` or `pytorch` |
+| `--json` | Machine readable output instead of the table |
+| `--top-k` | Report at most N relations, best first |
+| `--min-confidence` | Drop relations below this score |
+
+### How extraction closes the gap the model leaves open
+
+The relation head is trained on DocRED's gold coreference clusters, delivered
+through `mention_mask`. Raw text has no such clusters, so `extract` has to build
+them, and it does so in four steps:
+
+1. Run the model to get BIO logits.
+2. Decode BIO tags into typed mention spans.
+3. **Cluster mentions into entities** by normalised surface form and type, with
+   a whole-word prefix rule so "Skai" joins "Skai TV".
+4. Build `mention_mask` and every ordered pair from those clusters, then run the
+   model a second time for the relation logits.
+
+Step 3 is a heuristic standing in for a coreference model that this pipeline
+never trains. It suits encyclopaedic prose, where entities recur verbatim, and
+it is the weakest link in end-to-end extraction: a pronoun referring back to an
+entity starts its own cluster instead of joining it. Step 4 is why extraction
+costs two forward passes rather than one — the input to the relation head
+depends on the output of the NER head.
+
 ## Design
 
 ```
@@ -110,8 +174,9 @@ src/nano_re/
   training/     device policy, losses, metrics, evaluator, trainer
   export/       ONNX exporter, INT8 quantiser, runtime adapter, benchmark
   artifacts/    model card builder, bundle assembler
+  inference/    text splitter, BIO decoder, clusterer, backends, console
   pipeline.py   Composition root sequencing the stages
-  cli.py        Thin argparse wrapper over the pipeline
+  cli.py        Thin argparse wrapper over the pipeline and the extractor
 ```
 
 Each stage depends on the abstraction above it, not on its neighbours. Swapping
@@ -214,8 +279,9 @@ codebase reads, forwards or stores it.
 
 - Documents are truncated to 512 sub-word tokens, which caps relation recall.
   The recall ceiling is measured and reported rather than hidden.
-- The relation head consumes gold entity spans through `mention_mask`. End-to-end
-  extraction needs the NER output clustered into coreference groups first, which
-  this model does not do.
+- The relation head consumes gold entity spans through `mention_mask`. For raw
+  text, `extract` supplies them from a surface-form clustering heuristic rather
+  than a trained coreference model, so pronouns and paraphrases do not join
+  their antecedent's cluster.
 - `train_distant` is supported by configuration but not exercised by default.
 - Evidence sentence prediction, DocRED's third subtask, is not implemented.

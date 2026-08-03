@@ -49,6 +49,8 @@ class MultiTaskEvaluator:
         num_batches = 0
 
         for batch in loader:
+            if batch is None:
+                continue
             batch = batch.to(device)
             with self._device_manager.autocast():
                 outputs = model(**batch.model_inputs())
