@@ -1,4 +1,4 @@
-# nano-relation-extractor
+# Nano Relation Extractor
 
 Multilingual extraction of entities and the relations between them, from plain
 text, on CPU.
