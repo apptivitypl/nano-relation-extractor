@@ -412,7 +412,7 @@ class Pipeline:
             target_coverage=self._config.model.vocabulary_coverage,
             min_vocab_size=self._config.model.min_vocabulary_size,
         )
-        trimmer.observe_documents(bundle.dataset.documents)
+        trimmer.observe_documents(bundle.dataset.documents())
         report = trimmer.trim(model.backbone)
         self._report(report.describe())
         self._report(

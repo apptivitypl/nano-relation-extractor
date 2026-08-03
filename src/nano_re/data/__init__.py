@@ -5,6 +5,7 @@ from .document import Document, Entity, Mention, RelationTriple
 from .encoder import DocumentEncoder, EncodedDocument
 from .module import CorpusBundle, DataModule
 from .multi_corpus import CorpusSpec, CorpusStatistics, MultiCorpusDataset
+from .record_index import RecordIndex, RecordLocation
 from .parsers import DocRedParser, KpwrParser, SredfmParser
 from .sources import (
     DocumentSource,
@@ -32,6 +33,8 @@ __all__ = [
     "ReDocredSource",
     "MultiTaskBatch",
     "MultiTaskCollator",
+    "RecordIndex",
+    "RecordLocation",
     "RedfmSource",
     "RelationTriple",
     "SredfmParser",

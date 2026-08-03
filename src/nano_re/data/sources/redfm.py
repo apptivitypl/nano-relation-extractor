@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
+from ..record_index import RecordIndex, RecordLocation, read_json_line, scan_json_lines
 from .jsonl import JsonlHubSource
 
 SREDFM_LANGUAGES: tuple[str, ...] = (
@@ -86,6 +87,53 @@ class MultilingualJsonlSource(JsonlHubSource):
         """
         name, _, language = split.partition(":")
         return self._template.format(split=name, language=language or self._languages[0])
+
+    def build_index(
+        self, split: str, limit: int | None = None, observer=None
+    ) -> RecordIndex:
+        """Scan every language once, interleaving the resulting index.
+
+        Languages are woven together in the index itself, so a truncated run
+        still sees every language rather than exhausting the first one. A limit
+        is therefore divided across the languages and applied while scanning,
+        not after: applying it afterwards would still read every byte of a
+        thirty gigabyte corpus to produce a handful of records.
+
+        Args:
+            split: Split name, without a language suffix.
+            limit: Optional cap on the total number of records indexed.
+            observer: Optional callable receiving each decoded record.
+
+        Returns:
+            An index able to re-read any of those records on demand.
+        """
+        share = None
+        if limit is not None:
+            share = -(-limit // max(1, len(self._languages)))
+
+        per_language: list[list[RecordLocation]] = []
+        for language in self._languages:
+            path = self.download(f"{split}:{language}")
+            found: list[RecordLocation] = []
+            for offset, record in scan_json_lines(path, limit=share):
+                if observer is not None:
+                    record.setdefault("lan", language)
+                    observer(record)
+                found.append(RecordLocation(path=path, offset=offset))
+            per_language.append(found)
+
+        locations: list[RecordLocation] = []
+        cursors = [0] * len(per_language)
+        remaining = sum(len(group) for group in per_language)
+        while len(locations) < remaining:
+            for index, group in enumerate(per_language):
+                if cursors[index] >= len(group):
+                    continue
+                if limit is not None and len(locations) >= limit:
+                    return RecordIndex(locations, read_json_line)
+                locations.append(group[cursors[index]])
+                cursors[index] += 1
+        return RecordIndex(locations, read_json_line)
 
     def iter_records(self, split: str, limit: int | None = None) -> Iterator[dict]:
         """Stream records across every configured language.

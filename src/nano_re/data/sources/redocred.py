@@ -49,6 +49,16 @@ class ReDocredSource(JsonlHubSource):
         )
         self._requested = languages
 
+    build_index = None
+    """Not indexable by byte offset.
+
+    The corpus is a single JSON array rather than one record per line, so there
+    are no line offsets to record. It is also small enough that this costs
+    nothing: the largest split is a few tens of megabytes, against the gigabytes
+    that motivated indexing in the first place. Setting this to ``None`` tells
+    the dataset to hold it in memory instead.
+    """
+
     @property
     def languages(self) -> tuple[str, ...]:
         """Languages this reader provides."""

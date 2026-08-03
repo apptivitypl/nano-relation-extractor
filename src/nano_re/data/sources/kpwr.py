@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
+from ..record_index import RecordIndex, RecordLocation
 from .jsonl import JsonlHubSource
 
 DOCUMENT_MARKER = "-DOCSTART"
@@ -73,6 +74,50 @@ class KpwrSource(JsonlHubSource):
         name = split.partition(":")[0]
         return SPLIT_FILES.get(name, SPLIT_FILES["train"])
 
+    def build_index(
+        self, split: str, limit: int | None = None, observer=None
+    ) -> RecordIndex:
+        """Scan the file once, recording where each sentence begins.
+
+        Args:
+            split: Split name.
+            limit: Optional cap on the number of sentences indexed.
+            observer: Optional callable receiving each decoded sentence.
+
+        Returns:
+            An index able to re-read any sentence on demand.
+        """
+        path = self.download(split)
+        locations: list[RecordLocation] = []
+        pending: int | None = None
+
+        with path.open("rb") as handle:
+            while True:
+                if limit is not None and len(locations) >= limit:
+                    break
+                offset = handle.tell()
+                raw = handle.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                if line.startswith(DOCUMENT_MARKER):
+                    continue
+                if not line.strip():
+                    pending = None
+                    continue
+                if pending is None:
+                    pending = offset
+                    locations.append(RecordLocation(path=path, offset=offset))
+
+        if observer is not None:
+            index = RecordIndex(locations, _read_sentence)
+            for position in range(len(index)):
+                record = index.read(position)
+                if record is not None:
+                    observer(record)
+            index.close()
+        return RecordIndex(locations, _read_sentence)
+
     def iter_records(self, split: str, limit: int | None = None) -> Iterator[dict]:
         """Yield one record per sentence.
 
@@ -109,3 +154,34 @@ class KpwrSource(JsonlHubSource):
 
         if tokens and (limit is None or emitted < limit):
             yield {"tokens": tokens, "tags": tags, "lang": "pl"}
+
+
+def _read_sentence(handle) -> dict | None:
+    """Read one sentence from a handle positioned at its first token.
+
+    Args:
+        handle: Binary file handle positioned at the sentence start.
+
+    Returns:
+        A record with ``tokens``, ``tags`` and ``lang``, or ``None`` at the end
+        of the file.
+    """
+    tokens: list[str] = []
+    tags: list[str] = []
+    while True:
+        raw = handle.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\n")
+        if line.startswith(DOCUMENT_MARKER):
+            continue
+        if not line.strip():
+            break
+        columns = line.split("\t")
+        if len(columns) < 2:
+            continue
+        tokens.append(columns[0])
+        tags.append(columns[-1])
+    if not tokens:
+        return None
+    return {"tokens": tokens, "tags": tags, "lang": "pl"}

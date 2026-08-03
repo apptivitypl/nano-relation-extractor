@@ -16,6 +16,8 @@ from typing import Iterator
 
 from huggingface_hub import hf_hub_download
 
+from ..record_index import RecordIndex, RecordLocation, read_json_line, scan_json_lines
+
 
 class JsonlHubSource:
     """Streams JSON Lines files from a Hub dataset repository.
@@ -119,6 +121,31 @@ class JsonlHubSource:
                     continue
                 emitted += 1
                 yield record
+
+    def build_index(
+        self, split: str, limit: int | None = None, observer=None
+    ) -> RecordIndex:
+        """Scan the split once, recording where each record begins.
+
+        The scan decodes every record anyway, so an observer may inspect them as
+        they pass. That keeps the corpus to a single read whatever the caller
+        needs from it.
+
+        Args:
+            split: Split name understood by the concrete implementation.
+            limit: Optional cap on the number of records indexed.
+            observer: Optional callable receiving each decoded record.
+
+        Returns:
+            An index able to re-read any of those records on demand.
+        """
+        locations: list[RecordLocation] = []
+        path = self.download(split)
+        for offset, record in scan_json_lines(path, limit=limit):
+            if observer is not None:
+                observer(record)
+            locations.append(RecordLocation(path=path, offset=offset))
+        return RecordIndex(locations, read_json_line)
 
     def count(self, split: str, limit: int | None = None) -> int:
         """Count records in a split, memoising the result.
