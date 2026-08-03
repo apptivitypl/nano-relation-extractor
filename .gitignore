@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# nano-relation-extractor pipeline outputs
+artifacts/
+*.onnx
+*.safetensors
