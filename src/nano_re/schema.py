@@ -4,12 +4,11 @@ The schema is the single source of truth for both task label spaces. Training,
 evaluation, ONNX export and the generated model card all read the same object,
 so head widths and decoded label names can never drift apart.
 
-Two corpora feed the model and they disagree about entity types: SREDFM uses
-thirteen, MultiNERD fifteen. Rather than train on whichever happens to arrive
-first, both are mapped onto one canonical inventory chosen for graph
-construction: the types that become nodes worth linking. Everything else folds
-into ``MISC`` instead of inflating the tag set with classes a downstream graph
-would ignore.
+The corpora disagree about entity types: SREDFM uses thirteen, KPWr eighty-two.
+Rather than train on whichever happens to arrive first, each is mapped onto one
+canonical inventory chosen for graph construction, the types that become nodes
+worth linking. Everything else folds into ``MISC`` instead of inflating the tag
+set with classes a downstream consumer would ignore.
 """
 
 from __future__ import annotations
@@ -50,61 +49,6 @@ SREDFM_TYPE_MAP: dict[str, str] = {
     "UNK": "MISC",
 }
 """Mapping from SREDFM entity types onto the canonical inventory."""
-
-MULTINERD_TYPE_MAP: dict[str, str] = {
-    "PER": "PER",
-    "ORG": "ORG",
-    "LOC": "LOC",
-    "TIME": "TIME",
-    "MEDIA": "MEDIA",
-    "EVE": "EVE",
-    "ANIM": "MISC",
-    "BIO": "MISC",
-    "CEL": "MISC",
-    "DIS": "MISC",
-    "FOOD": "MISC",
-    "INST": "MISC",
-    "MYTH": "MISC",
-    "PLANT": "MISC",
-    "VEHI": "MISC",
-}
-"""Mapping from MultiNERD entity types onto the canonical inventory."""
-
-MULTINERD_TAGS: tuple[str, ...] = (
-    "O",
-    "B-PER",
-    "I-PER",
-    "B-ORG",
-    "I-ORG",
-    "B-LOC",
-    "I-LOC",
-    "B-ANIM",
-    "I-ANIM",
-    "B-BIO",
-    "I-BIO",
-    "B-CEL",
-    "I-CEL",
-    "B-DIS",
-    "I-DIS",
-    "B-EVE",
-    "I-EVE",
-    "B-FOOD",
-    "I-FOOD",
-    "B-INST",
-    "I-INST",
-    "B-MEDIA",
-    "I-MEDIA",
-    "B-MYTH",
-    "I-MYTH",
-    "B-PLANT",
-    "I-PLANT",
-    "B-TIME",
-    "I-TIME",
-    "B-VEHI",
-    "I-VEHI",
-)
-"""MultiNERD's own tag inventory, indexed exactly as the corpus encodes it."""
-
 
 def canonical_entity_type(raw_type: str, mapping: dict[str, str]) -> str:
     """Fold a corpus specific entity type onto the canonical inventory.

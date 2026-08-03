@@ -133,7 +133,7 @@ class Pipeline:
             The label schema, also written to the artifact directory.
         """
         module = self.data_module
-        self._report(f"Jezyki: {', '.join(module.languages)}")
+        self._report(f"Languages: {', '.join(module.languages)}")
         bundle = module.build_corpus(self._config.data.train_split, training=True)
         self._report(bundle.describe())
 
@@ -141,16 +141,18 @@ class Pipeline:
         counts = module.inventory.counts
         rare = sum(1 for count in counts.values() if count < 10)
         self._report(
-            f"Schemat: {schema.num_bio_labels} tagow BIO, "
-            f"{schema.num_relation_labels} klas relacji "
-            f"(z {len(counts)} zaobserwowanych predykatow, {rare} ponizej 10 wystapien)."
+            f"Schema: {schema.num_bio_labels} BIO tags, "
+            f"{schema.num_relation_labels} relation classes, drawn from "
+            f"{len(counts)} observed predicates of which {rare} occur fewer "
+            "than ten times."
         )
         for index in range(min(len(bundle.dataset), 50)):
             sample = bundle.dataset[index]
             if sample is not None:
                 self._report(
-                    f"Pierwszy dokument: {sample.input_ids.shape[0]} subwordow, "
-                    f"{sample.num_entities} encji, {sample.num_pairs} par kandydujacych."
+                    f"First document: {sample.input_ids.shape[0]} sub-words, "
+                    f"{sample.num_entities} entities, {sample.num_pairs} "
+                    "candidate pairs."
                 )
                 break
         schema.save(self.artifacts_dir / SCHEMA_FILENAME)
@@ -177,7 +179,7 @@ class Pipeline:
 
         model = self._build_model(schema)
         self._report(
-            f"Model zlozony: {count_parameters(model) / 1e6:.1f}M parametrow."
+            f"Model assembled: {count_parameters(model) / 1e6:.1f}M parameters."
         )
         self._trim_vocabulary(model, module, train_bundle)
 
@@ -234,12 +236,11 @@ class Pipeline:
         int8_path = self.artifacts_dir / self._config.export.int8_filename
 
         export_report = OnnxExporter(self._config.export).export(model, fp32_path)
-        deviation = max(
-            export_report.max_ner_deviation, export_report.max_relation_deviation
-        )
         self._report(
             f"Exported with the {export_report.exporter} backend at opset "
-            f"{export_report.opset_version}; maximum deviation {deviation:.2e}."
+            f"{export_report.opset_version}; relative deviation "
+            f"{export_report.max_relative_deviation:.2e}, decisions match: "
+            f"{export_report.decisions_match}."
         )
 
         quantization = DynamicInt8Quantizer(self._config.export).quantize(
@@ -415,7 +416,7 @@ class Pipeline:
         report = trimmer.trim(model.backbone)
         self._report(report.describe())
         self._report(
-            f"Model po przycieciu: {count_parameters(model) / 1e6:.1f}M parametrow."
+            f"Model after trimming: {count_parameters(model) / 1e6:.1f}M parameters."
         )
 
     def _build_model(self, schema: LabelSchema):

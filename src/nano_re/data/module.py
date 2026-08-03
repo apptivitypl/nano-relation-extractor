@@ -21,8 +21,8 @@ from ..schema import LabelSchema, RelationInventory
 from .collator import MultiTaskCollator
 from .encoder import DocumentEncoder
 from .multi_corpus import CorpusSpec, CorpusStatistics, MultiCorpusDataset
-from .parsers import MultiNerdParser, SredfmParser
-from .sources import MultiNerdSource, RedfmSource, SredfmSource
+from .parsers import DocRedParser, KpwrParser, SredfmParser
+from .sources import KpwrSource, ReDocredSource, RedfmSource, SredfmSource
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ class CorpusBundle:
 
     def describe(self) -> str:
         """Return a human readable summary of every contributing corpus."""
-        lines = [f"Strumien: {len(self.dataset)} dokumentow"]
+        lines = [f"Stream: {len(self.dataset)} documents"]
         lines.extend(item.describe() for item in self.statistics)
         return "\n".join(lines)
 
@@ -142,7 +142,15 @@ class DataModule:
         Returns:
             The configured reader.
         """
-        return MultiNerdSource(languages=self._data_config.languages)
+        return KpwrSource(languages=self._data_config.languages)
+
+    def build_english_relation_source(self):
+        """Create the reader for the English document-level relation corpus.
+
+        Returns:
+            The configured reader.
+        """
+        return ReDocredSource(languages=self._data_config.languages)
 
     def build_corpus(
         self, split: str, training: bool, gold: bool = False
@@ -179,9 +187,20 @@ class DataModule:
                 CorpusSpec(
                     name=self._data_config.entity_corpus,
                     source=self.build_entity_source(),
-                    parser=MultiNerdParser(),
-                    split=split if split != "dev" else "test",
+                    parser=KpwrParser(),
+                    split=split,
                     weight=self._data_config.entity_weight,
+                    limit=limit,
+                )
+            )
+        if training and self._data_config.english_relation_weight > 0:
+            specs.append(
+                CorpusSpec(
+                    name=self._data_config.english_relation_corpus,
+                    source=self.build_english_relation_source(),
+                    parser=DocRedParser(inventory=self._inventory),
+                    split=split,
+                    weight=self._data_config.english_relation_weight,
                     limit=limit,
                 )
             )

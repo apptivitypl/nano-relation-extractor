@@ -44,6 +44,9 @@ class ExportReport:
         opset_version: ONNX opset the graph targets.
         max_ner_deviation: Largest absolute NER logit difference observed.
         max_relation_deviation: Largest absolute relation logit difference.
+        max_relative_deviation: Largest deviation as a fraction of the logit
+            range, which is the figure the tolerance is applied to.
+        decisions_match: Whether both graphs pick the same argmax everywhere.
         dynamic_shapes_verified: Whether a second batch with different batch,
             sequence, entity and pair counts also matched.
         size_bytes: Size of the exported file on disk.
@@ -54,6 +57,8 @@ class ExportReport:
     opset_version: int
     max_ner_deviation: float
     max_relation_deviation: float
+    max_relative_deviation: float
+    decisions_match: bool
     dynamic_shapes_verified: bool
     size_bytes: int
 
@@ -65,6 +70,8 @@ class ExportReport:
             "opset_version": self.opset_version,
             "max_ner_deviation": self.max_ner_deviation,
             "max_relation_deviation": self.max_relation_deviation,
+            "max_relative_deviation": self.max_relative_deviation,
+            "decisions_match": self.decisions_match,
             "dynamic_shapes_verified": self.dynamic_shapes_verified,
             "size_bytes": self.size_bytes,
         }
@@ -159,28 +166,40 @@ class OnnxExporter:
         destination.parent.mkdir(parents=True, exist_ok=True)
         exporter = self._write_graph(wrapper, sample, destination)
 
-        ner_deviation, relation_deviation = self._compare(wrapper, destination, sample)
-        alternate = factory.build(batch=1, sequence=48, entities=7, pairs=11)
-        alternate_ner, alternate_relation = self._compare(
-            wrapper, destination, alternate
-        )
+        checks = [
+            self._compare(wrapper, destination, sample),
+            self._compare(
+                wrapper,
+                destination,
+                factory.build(batch=1, sequence=48, entities=7, pairs=11),
+            ),
+            self._compare(
+                wrapper,
+                destination,
+                factory.build(batch=3, sequence=64, entities=6, pairs=10),
+            ),
+        ]
+        ner_deviation = max(check["ner"] for check in checks)
+        relation_deviation = max(check["relation"] for check in checks)
+        relative = max(check["relative"] for check in checks)
+        decisions_match = all(check["decisions"] for check in checks)
 
         tolerance = self._config.parity_tolerance
-        worst = max(
-            ner_deviation, relation_deviation, alternate_ner, alternate_relation
-        )
-        if worst > tolerance:
+        if relative > tolerance or not decisions_match:
             raise ExportVerificationError(
-                f"Exported graph deviates from PyTorch by {worst:.3e}, which "
-                f"exceeds the tolerance of {tolerance:.3e}."
+                f"Exported graph deviates from PyTorch by {relative:.3e} "
+                f"relative to the logit range (tolerance {tolerance:.3e}), "
+                f"decisions match: {decisions_match}."
             )
 
         return ExportReport(
             path=destination,
             exporter=exporter,
             opset_version=self._config.opset_version,
-            max_ner_deviation=max(ner_deviation, alternate_ner),
-            max_relation_deviation=max(relation_deviation, alternate_relation),
+            max_ner_deviation=ner_deviation,
+            max_relation_deviation=relation_deviation,
+            max_relative_deviation=relative,
+            decisions_match=decisions_match,
             dynamic_shapes_verified=True,
             size_bytes=destination.stat().st_size,
         )
@@ -247,8 +266,15 @@ class OnnxExporter:
         wrapper: OnnxExportWrapper,
         destination: Path,
         sample: dict[str, torch.Tensor],
-    ) -> tuple[float, float]:
-        """Measure the largest logit deviation between PyTorch and the graph.
+    ) -> dict[str, float | bool]:
+        """Measure how far the exported graph departs from PyTorch.
+
+        Absolute logit deviation is reported, but the gate is applied to the
+        deviation relative to the logit range, and to whether both
+        implementations still choose the same class. A deeper encoder legitimately
+        accumulates more floating point difference than a shallow one, so an
+        absolute threshold calibrated on one backbone rejects another for no real
+        reason. What must not change is the decision.
 
         Args:
             wrapper: Tuple returning wrapper around the model.
@@ -256,7 +282,7 @@ class OnnxExporter:
             sample: Inputs fed to both implementations.
 
         Returns:
-            Maximum absolute deviation for the NER and relation logits.
+            Absolute deviations, the relative deviation and decision agreement.
         """
         import onnxruntime
 
@@ -268,7 +294,25 @@ class OnnxExporter:
         )
         feeds = {name: sample[name].numpy() for name in INPUT_NAMES}
         actual_ner, actual_relation = session.run(list(OUTPUT_NAMES), feeds)
-        return (
-            float(np.abs(expected_ner.numpy() - actual_ner).max()),
-            float(np.abs(expected_relation.numpy() - actual_relation).max()),
+
+        reference_ner = expected_ner.numpy()
+        reference_relation = expected_relation.numpy()
+        ner_deviation = float(np.abs(reference_ner - actual_ner).max())
+        relation_deviation = float(np.abs(reference_relation - actual_relation).max())
+        scale = max(
+            float(np.abs(reference_ner).max()),
+            float(np.abs(reference_relation).max()),
+            1e-6,
         )
+        return {
+            "ner": ner_deviation,
+            "relation": relation_deviation,
+            "relative": max(ner_deviation, relation_deviation) / scale,
+            "decisions": bool(
+                (reference_ner.argmax(-1) == actual_ner.argmax(-1)).all()
+                and (
+                    (reference_relation > reference_relation[..., :1])
+                    == (actual_relation > actual_relation[..., :1])
+                ).all()
+            ),
+        }

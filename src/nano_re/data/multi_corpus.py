@@ -69,8 +69,9 @@ class CorpusStatistics:
         role = "NER+RE" if self.supervises_relations else "NER only"
         languages = ",".join(self.languages) if self.languages else "?"
         return (
-            f"  {self.name:<10} {self.documents:>7} dok  {self.entities:>8} encji  "
-            f"{self.relations:>7} relacji  [{role}]  {languages}"
+            f"  {self.name:<10} {self.documents:>7} docs  "
+            f"{self.entities:>8} entities  {self.relations:>7} relations  "
+            f"[{role}]  {languages}"
         )
 
 
@@ -144,13 +145,19 @@ class MultiCorpusDataset(Dataset):
         return encoded
 
     def _load(self, specs: list[CorpusSpec]) -> None:
-        """Parse every corpus and interleave the results by weight.
+        """Parse every weighted corpus and interleave the results.
+
+        A corpus given a weight of zero is skipped before it is read, not after.
+        That matters beyond saving a download: parsing populates the relation
+        inventory that sizes the model's head, so a corpus excluded for licensing
+        reasons must not leave its predicates behind in the label schema.
 
         Args:
             specs: Corpora to draw from.
         """
         per_corpus: list[list[Document]] = []
-        for spec in specs:
+        active = [spec for spec in specs if spec.weight > 0]
+        for spec in active:
             documents = list(self._parse(spec))
             per_corpus.append(documents)
             languages = sorted(
@@ -172,7 +179,7 @@ class MultiCorpusDataset(Dataset):
                     languages=tuple(languages),
                 )
             )
-        self._documents = self._interleave(per_corpus, [s.weight for s in specs])
+        self._documents = self._interleave(per_corpus, [s.weight for s in active])
 
     def _parse(self, spec: CorpusSpec) -> Iterator[Document]:
         """Stream and parse one corpus.

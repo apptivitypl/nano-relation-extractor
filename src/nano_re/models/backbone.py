@@ -11,6 +11,38 @@ from torch import nn
 from transformers import AutoConfig, AutoModel
 
 
+def _instantiate(build, attn_implementation: str):
+    """Build an encoder, tolerating differences between model families.
+
+    ``add_pooling_layer`` drops a randomly initialised pooler that BERT and
+    RoBERTa attach and this model never uses, but newer architectures such as
+    ModernBERT do not accept the argument at all. Rather than branch on the
+    model type, each optional argument is tried and dropped if rejected, so a
+    backbone can be swapped without editing this file.
+
+    Args:
+        build: Callable receiving the optional keyword arguments.
+        attn_implementation: Attention kernel to request. Fused kernels do not
+            trace into a portable ONNX graph, so eager is what callers ask for.
+
+    Returns:
+        The instantiated encoder.
+    """
+    attempts = (
+        {"add_pooling_layer": False, "attn_implementation": attn_implementation},
+        {"attn_implementation": attn_implementation},
+        {"add_pooling_layer": False},
+        {},
+    )
+    last: Exception | None = None
+    for extra in attempts:
+        try:
+            return build(**extra)
+        except (TypeError, ValueError) as error:
+            last = error
+    raise RuntimeError(f"Could not instantiate the encoder: {last}")
+
+
 class EncoderBackbone(nn.Module):
     """Produces contextual token representations shared by both task heads.
 
@@ -67,11 +99,11 @@ class EncoderBackbone(nn.Module):
         Returns:
             The wrapped encoder.
         """
-        encoder = AutoModel.from_pretrained(
-            name_or_path,
-            add_pooling_layer=False,
+        encoder = _instantiate(
+            lambda **extra: AutoModel.from_pretrained(
+                name_or_path, dtype=torch.float32, **extra
+            ),
             attn_implementation=attn_implementation,
-            dtype=torch.float32,
         )
         return cls(encoder)
 
@@ -100,8 +132,9 @@ class EncoderBackbone(nn.Module):
         config = AutoConfig.from_pretrained(name_or_path)
         if vocab_size is not None:
             config.vocab_size = vocab_size
-        encoder = AutoModel.from_config(
-            config, add_pooling_layer=False, attn_implementation="eager"
+        encoder = _instantiate(
+            lambda **extra: AutoModel.from_config(config, **extra),
+            attn_implementation="eager",
         )
         remap = (
             torch.zeros(original_vocab_size, dtype=torch.long)

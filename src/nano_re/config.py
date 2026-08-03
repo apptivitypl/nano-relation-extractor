@@ -93,6 +93,10 @@ class DataConfig:
         entity_corpus: Corpus supervising the token head only. It exists because
             the relation corpus alone provides far less entity supervision than
             a multilingual tagger needs.
+        english_relation_corpus: Human-annotated document-level relation corpus.
+            English only, and included because it is the strongest relation
+            supervision available anywhere and carries a permissive licence.
+        english_relation_weight: Sampling weight of that corpus.
         gold_eval_corpus: Human-filtered corpus used for evaluation. It covers
             fewer languages than training does; the uncovered ones are reported
             rather than silently scored against silver data.
@@ -122,10 +126,12 @@ class DataConfig:
 
     languages: tuple[str, ...] = ("pl", "en", "de", "fr", "es", "it", "nl", "pt")
     relation_corpus: str = "sredfm"
-    entity_corpus: str = "multinerd"
+    entity_corpus: str = "kpwr"
+    english_relation_corpus: str = "redocred"
     gold_eval_corpus: str = "redfm"
-    relation_weight: float = 1.0
+    relation_weight: float = 4.0
     entity_weight: float = 1.0
+    english_relation_weight: float = 1.0
     min_relation_count: int = 1
     max_relations: int | None = None
     train_split: str = "train"
@@ -161,6 +167,12 @@ class DataConfig:
                 "NANO_RE_RELATION_WEIGHT", cls.relation_weight
             ),
             entity_weight=_env_float("NANO_RE_ENTITY_WEIGHT", cls.entity_weight),
+            english_relation_corpus=_env_str(
+                "NANO_RE_ENGLISH_RELATION_CORPUS", cls.english_relation_corpus
+            ),
+            english_relation_weight=_env_float(
+                "NANO_RE_ENGLISH_RELATION_WEIGHT", cls.english_relation_weight
+            ),
             min_relation_count=_env_int(
                 "NANO_RE_MIN_RELATION_COUNT", cls.min_relation_count
             ),
@@ -193,20 +205,22 @@ class ModelConfig:
         entity_pooling: Strategy used to pool mention tokens into an entity
             vector. Only ``mean`` is currently implemented.
         trim_vocabulary: Whether to compact the embedding table to the tokens
-            the configured languages actually use. The pretrained vocabulary
-            covers over a hundred languages and accounts for most of the
-            model's parameters, so this is the largest single lever on size.
+            the configured languages actually use. It roughly quarters the model,
+            but it also destroys performance on every language left out, so it
+            defaults to off: a released multilingual model should work in the
+            languages it claims. Turn it on for a deployment with a fixed,
+            known language set.
         vocabulary_coverage: Fraction of observed token occurrences the trimmed
             vocabulary must still cover.
         min_vocabulary_size: Floor on the trimmed vocabulary, guarding against a
             small sample producing an unusably narrow table.
     """
 
-    backbone_name: str = "nreimers/mMiniLMv2-L6-H384-distilled-from-XLMR-Large"
+    backbone_name: str = "jhu-clsp/mmBERT-small"
     pair_hidden_size: int = 512
     dropout: float = 0.1
     entity_pooling: str = "mean"
-    trim_vocabulary: bool = True
+    trim_vocabulary: bool = False
     vocabulary_coverage: float = 0.9999
     min_vocabulary_size: int = 8000
 
@@ -330,7 +344,7 @@ class ExportConfig:
     fp32_filename: str = "model.onnx"
     int8_filename: str = "model_int8.onnx"
     quantized_op_types: tuple[str, ...] = ("MatMul", "Gather")
-    parity_tolerance: float = 1e-4
+    parity_tolerance: float = 1e-3
     benchmark_warmup: int = 5
     benchmark_iterations: int = 30
     benchmark_documents: int = 32

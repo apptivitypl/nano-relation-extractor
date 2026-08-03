@@ -1,7 +1,10 @@
 [project]
 name = "nano-re"
 version = "0.1.0"
-description = "Multi-task NER and document-level relation extraction with INT8 ONNX deployment"
+description = "Multilingual entity and relation extraction for building knowledge graphs, small enough to run on CPU"
+license = "Apache-2.0 OR MIT"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
+keywords = ["ner", "relation-extraction", "multilingual", "onnx", "information-extraction"]
 readme = "README.md"
 authors = [
     { name = "Patryk Pasek", email = "patrykpasek@onet.pl" }

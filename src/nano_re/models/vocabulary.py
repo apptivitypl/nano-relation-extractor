@@ -1,9 +1,9 @@
 """Trimming the embedding table to the languages actually in scope.
 
-The multilingual encoder carries a 250k token vocabulary covering more than a
-hundred languages, and that table is 96 of the model's 107.7M parameters. A
-deployment that handles eight European languages pays for the other hundred in
-memory and file size and gets nothing back.
+The multilingual encoder carries a vocabulary covering well over a hundred
+languages, and that table is most of the model: 98.3M of mmBERT-small's 140.5M
+parameters. A deployment fixed to a handful of languages pays for all the others
+in memory and file size and gets nothing back.
 
 Trimming keeps the tokens the corpora actually use and rebuilds the embedding
 matrix around them. The tokenizer is deliberately left untouched: rewriting a
@@ -62,10 +62,10 @@ class TrimReport:
     def describe(self) -> str:
         """Return a one-line human readable summary."""
         return (
-            f"Slownik: {self.original_size} -> {self.trimmed_size} tokenow "
-            f"({self.reduction:.1%} mniej), pokrycie {self.coverage:.4f} "
-            f"na {self.documents_sampled} dokumentach, "
-            f"{self.parameters_removed / 1e6:.1f}M parametrow usunietych."
+            f"Vocabulary: {self.original_size} -> {self.trimmed_size} tokens "
+            f"({self.reduction:.1%} smaller), coverage {self.coverage:.4f} over "
+            f"{self.documents_sampled} documents, "
+            f"{self.parameters_removed / 1e6:.1f}M parameters removed."
         )
 
 

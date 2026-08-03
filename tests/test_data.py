@@ -13,7 +13,7 @@ import torch
 from nano_re.data.collator import MultiTaskCollator
 from nano_re.data.encoder import EncodedDocument
 from nano_re.data.multi_corpus import MultiCorpusDataset
-from nano_re.data.parsers import MultiNerdParser, SredfmParser
+from nano_re.data.parsers import DocRedParser, KpwrParser, SredfmParser
 from nano_re.schema import RelationInventory
 
 SREDFM_RECORD = {
@@ -81,23 +81,48 @@ def test_sredfm_widens_a_mid_word_boundary() -> None:
     assert document.words[mention.start : mention.end] == ("Skai",)
 
 
-def test_multinerd_reconstructs_spans_and_folds_types() -> None:
-    """Tag indices become spans, and fine types fold onto the canonical set."""
-    record = {"tokens": ["Adam", "Nowak", "je", "jablko"], "ner_tags": [1, 2, 0, 25],
-              "lang": "pl"}
-    document = MultiNerdParser().parse(record, 0)
+def test_kpwr_reconstructs_spans_and_folds_categories() -> None:
+    """IOB tags become spans, and the 82 categories fold onto the canonical set."""
+    record = {
+        "tokens": ["Adam", "Nowak", "pracuje", "w", "Orlen"],
+        "tags": ["B-nam_liv_person", "I-nam_liv_person", "O", "O",
+                 "B-nam_org_company"],
+        "lang": "pl",
+    }
+    document = KpwrParser().parse(record, 0)
     assert [(e.mentions[0].text, e.entity_type) for e in document.entities] == [
         ("Adam Nowak", "PER"),
-        ("jablko", "MISC"),
+        ("Orlen", "ORG"),
     ]
 
 
-def test_multinerd_documents_declare_no_relation_supervision() -> None:
+def test_kpwr_documents_declare_no_relation_supervision() -> None:
     """An entity-only corpus must not claim relation labels."""
-    record = {"tokens": ["Adam"], "ner_tags": [1], "lang": "pl"}
-    document = MultiNerdParser().parse(record, 0)
+    record = {"tokens": ["Adam"], "tags": ["B-nam_liv_person"], "lang": "pl"}
+    document = KpwrParser().parse(record, 0)
     assert document.has_labels is False
     assert document.relations == ()
+
+
+def test_kpwr_unknown_category_falls_back_to_misc() -> None:
+    """A category outside the prefix rules is not silently dropped."""
+    record = {"tokens": ["cos"], "tags": ["B-nam_oth_currency"], "lang": "pl"}
+    document = KpwrParser().parse(record, 0)
+    assert document.entities[0].entity_type == "MISC"
+
+
+def test_docred_converts_sentence_local_offsets_to_global() -> None:
+    """A mention in the second sentence gets a document-global word index."""
+    record = {
+        "title": "d",
+        "sents": [["Ala", "ma", "kota"], ["Kot", "spi"]],
+        "vertexSet": [[{"name": "Kot", "pos": [0, 1], "sent_id": 1, "type": "MISC"}]],
+        "labels": [],
+    }
+    document = DocRedParser().parse(record, 0)
+    mention = document.entities[0].mentions[0]
+    assert (mention.start, mention.end) == (3, 4)
+    assert document.words[mention.start] == "Kot"
 
 
 def _encoded(has_relations: bool) -> EncodedDocument:

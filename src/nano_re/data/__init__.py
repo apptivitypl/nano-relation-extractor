@@ -5,8 +5,14 @@ from .document import Document, Entity, Mention, RelationTriple
 from .encoder import DocumentEncoder, EncodedDocument
 from .module import CorpusBundle, DataModule
 from .multi_corpus import CorpusSpec, CorpusStatistics, MultiCorpusDataset
-from .parsers import MultiNerdParser, SredfmParser
-from .sources import DocumentSource, MultiNerdSource, RedfmSource, SredfmSource
+from .parsers import DocRedParser, KpwrParser, SredfmParser
+from .sources import (
+    DocumentSource,
+    KpwrSource,
+    ReDocredSource,
+    RedfmSource,
+    SredfmSource,
+)
 
 __all__ = [
     "CorpusBundle",
@@ -20,8 +26,10 @@ __all__ = [
     "Entity",
     "Mention",
     "MultiCorpusDataset",
-    "MultiNerdParser",
-    "MultiNerdSource",
+    "DocRedParser",
+    "KpwrParser",
+    "KpwrSource",
+    "ReDocredSource",
     "MultiTaskBatch",
     "MultiTaskCollator",
     "RedfmSource",
