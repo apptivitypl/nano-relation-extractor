@@ -215,13 +215,17 @@ class DataModule:
             dataset=dataset, statistics=tuple(dataset.statistics)
         )
 
-    def build_loader(self, dataset, batch_size: int, shuffle: bool) -> DataLoader:
+    def build_loader(
+        self, dataset, batch_size: int, shuffle: bool, tuning=None
+    ) -> DataLoader:
         """Wrap a dataset in a data loader.
 
         Args:
             dataset: Dataset yielding encoded documents or ``None``.
             batch_size: Documents per batch.
             shuffle: Whether to shuffle between epochs.
+            tuning: Optional device tuning supplying loader settings that depend
+                on the backend, such as pinned memory and worker count.
 
         Returns:
             A configured :class:`torch.utils.data.DataLoader`.
@@ -232,11 +236,18 @@ class DataModule:
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             raise ValueError("Tokenizer does not define a padding token.")
+        workers = self._data_config.num_workers
+        pin_memory = False
+        if tuning is not None:
+            if workers < 0:
+                workers = tuning.num_workers
+            pin_memory = tuning.pin_memory
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=self._data_config.num_workers,
+            num_workers=max(0, workers),
+            pin_memory=pin_memory,
             collate_fn=MultiTaskCollator(pad_token_id=pad_token_id),
         )
 

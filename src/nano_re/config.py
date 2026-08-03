@@ -112,9 +112,12 @@ class DataConfig:
         max_sequence_length: Maximum number of sub-word tokens per document.
         max_negative_pairs: Number of sampled negative entity pairs per training
             document. Evaluation always scores every candidate pair.
-        train_batch_size: Number of documents per training batch.
-        eval_batch_size: Number of documents per evaluation batch.
-        num_workers: Data loader worker processes.
+        train_batch_size: Documents per training batch. Zero selects the
+            measured default for the detected device.
+        eval_batch_size: Documents per evaluation batch. Zero selects the
+            measured default for the detected device.
+        num_workers: Loader worker processes. Negative selects the measured
+            default for the detected device.
         limit: Optional cap on the number of documents per split, used for smoke
             tests. ``None`` means no cap.
         max_cached_documents: Largest split kept as encoded tensors between
@@ -138,9 +141,9 @@ class DataConfig:
     eval_split: str = "dev"
     max_sequence_length: int = 512
     max_negative_pairs: int = 96
-    train_batch_size: int = 4
-    eval_batch_size: int = 4
-    num_workers: int = 0
+    train_batch_size: int = 0
+    eval_batch_size: int = 0
+    num_workers: int = -1
     limit: int | None = None
     max_cached_documents: int = 20000
     cache_dir: Path | None = None
@@ -204,6 +207,11 @@ class ModelConfig:
         dropout: Dropout probability applied inside both task heads.
         entity_pooling: Strategy used to pool mention tokens into an entity
             vector. Only ``mean`` is currently implemented.
+        localized_context: Whether the relation head receives a context vector
+            built from the tokens both entities attend to. It is the second half
+            of the adaptive thresholding method and improves relation quality,
+            at the cost of materialising the encoder's attention maps, which
+            grow with the square of the sequence length.
         trim_vocabulary: Whether to compact the embedding table to the tokens
             the configured languages actually use. It roughly quarters the model,
             but it also destroys performance on every language left out, so it
@@ -220,6 +228,7 @@ class ModelConfig:
     pair_hidden_size: int = 512
     dropout: float = 0.1
     entity_pooling: str = "mean"
+    localized_context: bool = True
     trim_vocabulary: bool = False
     vocabulary_coverage: float = 0.9999
     min_vocabulary_size: int = 8000
@@ -235,6 +244,9 @@ class ModelConfig:
             backbone_name=_env_str("NANO_RE_BACKBONE", cls.backbone_name),
             pair_hidden_size=_env_int("NANO_RE_PAIR_HIDDEN_SIZE", cls.pair_hidden_size),
             dropout=_env_float("NANO_RE_DROPOUT", cls.dropout),
+            localized_context=_env_bool(
+                "NANO_RE_LOCALIZED_CONTEXT", cls.localized_context
+            ),
             trim_vocabulary=_env_bool(
                 "NANO_RE_TRIM_VOCABULARY", cls.trim_vocabulary
             ),

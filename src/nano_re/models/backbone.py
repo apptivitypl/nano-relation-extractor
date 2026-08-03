@@ -149,18 +149,32 @@ class EncoderBackbone(nn.Module):
         return int(self.encoder.config.hidden_size)
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Encode a padded batch of sub-word sequences.
 
         Args:
             input_ids: Sub-word identifiers, shape ``[B, S]``.
             attention_mask: Padding mask, shape ``[B, S]``.
+            return_attention: Whether to also return the final layer's attention,
+                averaged over heads. Localized context pooling needs it; nothing
+                else does, and requesting it materialises every layer's attention
+                map, so it is opt-in.
 
         Returns:
-            Contextual token representations, shape ``[B, S, H]``.
+            Token representations of shape ``[B, S, H]``, and when requested the
+            averaged final attention of shape ``[B, S, S]``.
         """
         if self.token_remap is not None:
             input_ids = self.token_remap[input_ids]
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        return outputs.last_hidden_state
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=return_attention,
+        )
+        if not return_attention:
+            return outputs.last_hidden_state
+        return outputs.last_hidden_state, outputs.attentions[-1].mean(dim=1)

@@ -2,13 +2,19 @@
 
 from .backbone import EncoderBackbone
 from .factory import NanoREModelFactory, count_parameters
-from .heads import EntityPooler, PairwiseRelationHead, TokenClassificationHead
+from .heads import (
+    EntityPooler,
+    LocalizedContextPooler,
+    PairwiseRelationHead,
+    TokenClassificationHead,
+)
 from .modeling_nano_re import NanoREArchitecture, NanoREModel, OnnxExportWrapper
 from .outputs import MultiTaskOutput
 
 __all__ = [
     "EncoderBackbone",
     "EntityPooler",
+    "LocalizedContextPooler",
     "MultiTaskOutput",
     "NanoREArchitecture",
     "NanoREModel",

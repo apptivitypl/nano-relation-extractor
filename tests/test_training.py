@@ -205,3 +205,137 @@ def test_trimming_without_observations_is_refused() -> None:
         assert "observed" in str(error)
     else:
         raise AssertionError("expected a RuntimeError")
+
+
+def test_context_pooling_weights_the_tokens_both_entities_attend_to() -> None:
+    """The context vector is drawn from the overlap of two attentions.
+
+    Where one entity attends to the first token and the other to the second,
+    neither alone identifies a connection. Where both attend to the same token,
+    that token is what links them, and it is what the context must contain.
+    """
+    from nano_re.models.heads import LocalizedContextPooler
+
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [5.0, 5.0]]])
+    attention = torch.tensor(
+        [
+            [
+                [0.5, 0.0, 0.5],
+                [0.0, 0.5, 0.5],
+                [0.34, 0.33, 0.33],
+            ]
+        ]
+    )
+    mention_mask = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+    pair_index = torch.tensor([[[0, 1]]])
+
+    context = LocalizedContextPooler()(hidden, attention, mention_mask, pair_index)
+    assert torch.allclose(context[0, 0], hidden[0, 2], atol=1e-5)
+
+
+def test_context_pooling_shapes_follow_the_pair_axis() -> None:
+    """One context vector is produced per candidate pair."""
+    from nano_re.models.heads import LocalizedContextPooler
+
+    hidden = torch.randn(2, 12, 8)
+    attention = torch.softmax(torch.randn(2, 12, 12), dim=-1)
+    mention_mask = torch.rand(2, 5, 12)
+    mention_mask = mention_mask / mention_mask.sum(-1, keepdim=True)
+    pair_index = torch.randint(0, 5, (2, 7, 2))
+
+    context = LocalizedContextPooler()(hidden, attention, mention_mask, pair_index)
+    assert context.shape == (2, 7, 8)
+
+
+def test_relation_head_uses_the_context_when_given_one() -> None:
+    """Supplying a context changes the scores, so it is not being ignored."""
+    from nano_re.models.heads import PairwiseRelationHead
+
+    head = PairwiseRelationHead(
+        hidden_size=8, num_relations=4, pair_hidden_size=8, dropout=0.0,
+        use_context=True,
+    ).eval()
+    entities = torch.randn(1, 3, 8)
+    pair_index = torch.tensor([[[0, 1]]])
+
+    with torch.no_grad():
+        first = head(entities, pair_index, context=torch.zeros(1, 1, 8))
+        second = head(entities, pair_index, context=torch.ones(1, 1, 8))
+    assert not torch.allclose(first, second)
+
+
+def test_relation_head_without_context_ignores_it() -> None:
+    """A head built without context is unaffected by one being passed."""
+    from nano_re.models.heads import PairwiseRelationHead
+
+    head = PairwiseRelationHead(
+        hidden_size=8, num_relations=4, pair_hidden_size=8, dropout=0.0
+    ).eval()
+    entities = torch.randn(1, 3, 8)
+    pair_index = torch.tensor([[[0, 1]]])
+
+    with torch.no_grad():
+        first = head(entities, pair_index, context=torch.zeros(1, 1, 8))
+        second = head(entities, pair_index, context=torch.ones(1, 1, 8))
+    assert torch.allclose(first, second)
+
+
+def test_architecture_records_whether_context_pooling_is_present() -> None:
+    """A checkpoint states its own shape so it can be rebuilt correctly."""
+    from nano_re.models.modeling_nano_re import NanoREArchitecture
+
+    payload = NanoREArchitecture(
+        backbone_name="x",
+        hidden_size=8,
+        num_bio_labels=3,
+        num_relation_labels=4,
+        pair_hidden_size=8,
+        dropout=0.0,
+        localized_context=True,
+    ).to_dict()
+    assert NanoREArchitecture.from_dict(payload).localized_context is True
+
+
+def test_device_tuning_is_backend_specific() -> None:
+    """Each backend gets the settings measured to suit it."""
+    from nano_re.training.device import DeviceManager
+
+    cpu = DeviceManager(preference="cpu")
+    assert cpu.tuning.autocast_dtype is None
+    assert cpu.tuning.pin_memory is False
+    assert cpu.tuning.batch_size > 0
+
+
+def test_autocast_is_off_where_it_was_measured_slower() -> None:
+    """Apple Silicon and CPU run in float32.
+
+    Mixed precision is not a universal win. On an M4 Pro a training step was
+    measured at 341 ms in float32 against 369 ms under float16 autocast, so the
+    policy encodes the measurement rather than the folklore.
+    """
+    from nano_re.training.device import DeviceManager
+
+    for backend in ("cpu", "mps"):
+        try:
+            manager = DeviceManager(preference=backend)
+        except Exception:
+            continue
+        assert manager.amp_enabled is False
+        assert isinstance(manager.autocast().__enter__(), type(None))
+
+
+def test_explicit_batch_size_overrides_the_measured_default() -> None:
+    """A configured batch size is honoured; zero asks for the default."""
+    from nano_re.training.device import DeviceManager
+
+    manager = DeviceManager(preference="cpu")
+    assert manager.resolve_batch_size(32) == 32
+    assert manager.resolve_batch_size(0) == manager.tuning.batch_size
+
+
+def test_gradient_scaler_only_enabled_for_float16() -> None:
+    """bfloat16 keeps float32's exponent range and needs no scaling."""
+    from nano_re.training.device import DeviceManager
+
+    manager = DeviceManager(preference="cpu")
+    assert manager.grad_scaler().is_enabled() is False

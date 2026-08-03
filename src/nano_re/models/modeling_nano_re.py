@@ -13,7 +13,12 @@ import torch
 from torch import nn
 
 from .backbone import EncoderBackbone
-from .heads import EntityPooler, PairwiseRelationHead, TokenClassificationHead
+from .heads import (
+    EntityPooler,
+    LocalizedContextPooler,
+    PairwiseRelationHead,
+    TokenClassificationHead,
+)
 from .outputs import MultiTaskOutput
 
 
@@ -32,6 +37,8 @@ class NanoREArchitecture:
             once trimming has run.
         original_vocab_size: Size of the identifier lookup table, ``None`` when
             the vocabulary was never trimmed.
+        localized_context: Whether the relation head receives a pair specific
+            context vector built from encoder attention.
     """
 
     backbone_name: str
@@ -42,6 +49,7 @@ class NanoREArchitecture:
     dropout: float
     vocab_size: int | None = None
     original_vocab_size: int | None = None
+    localized_context: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON compatible representation of the architecture."""
@@ -74,6 +82,7 @@ class NanoREArchitecture:
                 if payload.get("original_vocab_size") is not None
                 else None
             ),
+            localized_context=bool(payload.get("localized_context", False)),
         )
 
 
@@ -86,6 +95,7 @@ class NanoREModel(nn.Module):
         entity_pooler: Layer pooling mention tokens into entity vectors.
         relation_head: Pairwise relation classifier.
         architecture: Serialisable description used when persisting the model.
+        context_pooler: Optional layer building a pair specific context vector.
     """
 
     def __init__(
@@ -95,12 +105,14 @@ class NanoREModel(nn.Module):
         entity_pooler: EntityPooler,
         relation_head: PairwiseRelationHead,
         architecture: NanoREArchitecture,
+        context_pooler: LocalizedContextPooler | None = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.ner_head = ner_head
         self.entity_pooler = entity_pooler
         self.relation_head = relation_head
+        self.context_pooler = context_pooler
         self._architecture = architecture
 
     @property
@@ -117,6 +129,7 @@ class NanoREModel(nn.Module):
             self._architecture,
             vocab_size=int(self.backbone.encoder.config.vocab_size),
             original_vocab_size=self.backbone.original_vocab_size,
+            localized_context=self.context_pooler is not None,
         )
 
     def forward(
@@ -137,12 +150,25 @@ class NanoREModel(nn.Module):
         Returns:
             Logits for both tasks together with the pooled entity vectors.
         """
-        hidden_states = self.backbone(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
+        if self.context_pooler is None:
+            hidden_states = self.backbone(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
+            context = None
+        else:
+            hidden_states, attention = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_attention=True,
+            )
+            context = self.context_pooler(
+                hidden_states, attention, mention_mask, pair_index
+            )
         ner_logits = self.ner_head(hidden_states)
         entity_representations = self.entity_pooler(hidden_states, mention_mask)
-        relation_logits = self.relation_head(entity_representations, pair_index)
+        relation_logits = self.relation_head(
+            entity_representations, pair_index, context=context
+        )
         return MultiTaskOutput(
             ner_logits=ner_logits,
             relation_logits=relation_logits,

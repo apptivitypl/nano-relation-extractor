@@ -194,14 +194,19 @@ class Pipeline:
         )
         device_manager = DeviceManager()
         self._report(f"Device: {device_manager.describe()}.")
+        tuning = device_manager.tuning
 
         train_loader = module.build_loader(
             train_bundle.dataset,
-            self._config.data.train_batch_size,
+            device_manager.resolve_batch_size(self._config.data.train_batch_size),
             shuffle=True,
+            tuning=tuning,
         )
         eval_loader = module.build_loader(
-            eval_bundle.dataset, self._config.data.eval_batch_size, shuffle=False
+            eval_bundle.dataset,
+            device_manager.resolve_batch_size(self._config.data.eval_batch_size),
+            shuffle=False,
+            tuning=tuning,
         )
 
         trainer = MultiTaskTrainer(
@@ -499,7 +504,9 @@ class Pipeline:
             )
         )
         loader = module.build_loader(
-            documents, self._config.data.eval_batch_size, shuffle=False
+            documents,
+            device_manager.resolve_batch_size(self._config.data.eval_batch_size),
+            shuffle=False,
         )
         evaluator = MultiTaskEvaluator(schema, criterion, device_manager)
         return evaluator.evaluate(adapter, loader)

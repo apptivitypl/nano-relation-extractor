@@ -74,6 +74,10 @@ class PairwiseRelationHead(nn.Module):
         pair_hidden_size: Width of the hidden layer.
         dropout: Dropout probability applied to the pair feature and the hidden
             activation.
+        use_context: Whether a pair context vector is supplied. When it is, each
+            entity vector is projected together with that context before the
+            pair feature is built, so the same entity is represented differently
+            depending on which other entity it is being compared against.
     """
 
     def __init__(
@@ -82,8 +86,13 @@ class PairwiseRelationHead(nn.Module):
         num_relations: int,
         pair_hidden_size: int = 512,
         dropout: float = 0.1,
+        use_context: bool = False,
     ) -> None:
         super().__init__()
+        self.use_context = use_context
+        if use_context:
+            self.head_projection = nn.Linear(hidden_size * 2, hidden_size)
+            self.tail_projection = nn.Linear(hidden_size * 2, hidden_size)
         self.mlp = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(hidden_size * 4, pair_hidden_size),
@@ -94,19 +103,26 @@ class PairwiseRelationHead(nn.Module):
         )
 
     def forward(
-        self, entity_representations: torch.Tensor, pair_index: torch.Tensor
+        self,
+        entity_representations: torch.Tensor,
+        pair_index: torch.Tensor,
+        context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score every candidate pair.
 
         Args:
             entity_representations: Entity vectors, shape ``[B, E, H]``.
             pair_index: Head and tail entity rows, shape ``[B, P, 2]``.
+            context: Optional pair context vectors, shape ``[B, P, H]``.
 
         Returns:
             Relation logits, shape ``[B, P, num_relations]``.
         """
         head = self._gather(entity_representations, pair_index[:, :, 0])
         tail = self._gather(entity_representations, pair_index[:, :, 1])
+        if self.use_context and context is not None:
+            head = torch.tanh(self.head_projection(torch.cat([head, context], dim=-1)))
+            tail = torch.tanh(self.tail_projection(torch.cat([tail, context], dim=-1)))
         features = torch.cat(
             [head, tail, head * tail, torch.abs(head - tail)], dim=-1
         )
@@ -128,3 +144,60 @@ class PairwiseRelationHead(nn.Module):
         hidden_size = entity_representations.shape[-1]
         expanded = indices.unsqueeze(-1).expand(-1, -1, hidden_size)
         return torch.gather(entity_representations, 1, expanded)
+
+
+class LocalizedContextPooler(nn.Module):
+    """Builds a context vector specific to each candidate entity pair.
+
+    Pooling an entity's own mentions says what the entity is; it says nothing
+    about which part of the document relates this entity to that one. Localized
+    context pooling reads that from the encoder's own attention: the tokens both
+    entities attend to are the tokens that connect them.
+
+    The construction follows Zhou et al., "Document-Level Relation Extraction
+    with Adaptive Thresholding and Localized Context Pooling" (AAAI 2021). This
+    is the second half of that method; the adaptive threshold loss is the first.
+
+    Every step is a batched matrix product, so the entity and pair axes stay
+    dynamic in the exported graph.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention: torch.Tensor,
+        mention_mask: torch.Tensor,
+        pair_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute one context vector per candidate pair.
+
+        Args:
+            hidden_states: Token representations, shape ``[B, S, H]``.
+            attention: Head-averaged attention, shape ``[B, S, S]``.
+            mention_mask: Row-normalised entity pooling weights, ``[B, E, S]``.
+            pair_index: Head and tail entity rows, shape ``[B, P, 2]``.
+
+        Returns:
+            Pair context vectors, shape ``[B, P, H]``.
+        """
+        entity_attention = torch.bmm(mention_mask, attention)
+        head = self._gather(entity_attention, pair_index[:, :, 0])
+        tail = self._gather(entity_attention, pair_index[:, :, 1])
+        overlap = head * tail
+        weights = overlap / overlap.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        return torch.bmm(weights, hidden_states)
+
+    @staticmethod
+    def _gather(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Select rows by index along the entity axis.
+
+        Args:
+            source: Per-entity rows, shape ``[B, E, S]``.
+            indices: Entity rows to select, shape ``[B, P]``.
+
+        Returns:
+            Selected rows, shape ``[B, P, S]``.
+        """
+        width = source.shape[-1]
+        expanded = indices.unsqueeze(-1).expand(-1, -1, width)
+        return torch.gather(source, 1, expanded)

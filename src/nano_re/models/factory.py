@@ -15,7 +15,12 @@ from safetensors.torch import load_file, save_file
 from ..config import ModelConfig
 from ..schema import LabelSchema
 from .backbone import EncoderBackbone
-from .heads import EntityPooler, PairwiseRelationHead, TokenClassificationHead
+from .heads import (
+    EntityPooler,
+    LocalizedContextPooler,
+    PairwiseRelationHead,
+    TokenClassificationHead,
+)
 from .modeling_nano_re import NanoREArchitecture, NanoREModel
 
 ARCHITECTURE_FILENAME = "config.json"
@@ -45,6 +50,7 @@ class NanoREModelFactory:
             dropout=model_config.dropout,
             vocab_size=int(backbone.encoder.config.vocab_size),
             original_vocab_size=backbone.original_vocab_size,
+            localized_context=model_config.localized_context,
         )
         return self._assemble(backbone, architecture)
 
@@ -125,8 +131,12 @@ class NanoREModelFactory:
                 num_relations=architecture.num_relation_labels,
                 pair_hidden_size=architecture.pair_hidden_size,
                 dropout=architecture.dropout,
+                use_context=architecture.localized_context,
             ),
             architecture=architecture,
+            context_pooler=(
+                LocalizedContextPooler() if architecture.localized_context else None
+            ),
         )
 
 
