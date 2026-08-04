@@ -22,6 +22,7 @@ from .device import DeviceManager
 from .evaluator import MultiTaskEvaluator
 from .losses import MultiTaskLoss
 from .metrics import EvaluationResult
+from .progress import ProgressTracker
 
 
 @dataclass(frozen=True)
@@ -239,7 +240,9 @@ class MultiTaskTrainer:
 
         for epoch in range(1, self._config.epochs + 1):
             epoch_start = time.perf_counter()
-            losses = self._run_epoch(train_loader, optimizer, scheduler, scaler)
+            losses = self._run_epoch(
+                train_loader, optimizer, scheduler, scaler, epoch
+            )
             evaluation = self._evaluator.evaluate(self._model, eval_loader)
             epoch_report = EpochReport(
                 epoch=epoch,
@@ -275,6 +278,7 @@ class MultiTaskTrainer:
         optimizer: torch.optim.Optimizer,
         scheduler,
         scaler: torch.amp.GradScaler,
+        epoch: int,
     ) -> tuple[float, float, float]:
         """Run a single training epoch.
 
@@ -283,18 +287,51 @@ class MultiTaskTrainer:
             optimizer: Optimiser to step.
             scheduler: Learning rate schedule advanced with the optimiser.
             scaler: Gradient scaler matching the mixed precision policy.
+            epoch: One-based epoch number, shown in the progress report.
 
         Returns:
             Mean total, NER and relation losses over the epoch.
         """
         self._model.train()
-        device = self._device_manager.device
         accumulation = max(1, self._config.gradient_accumulation_steps)
-        totals = [0.0, 0.0, 0.0]
-        num_batches = 0
+        totals = [0.0, 0.0, 0.0, 0.0]
         pending = 0
         optimizer.zero_grad(set_to_none=True)
+        tracker = ProgressTracker(
+            f"epoch {epoch}/{self._config.epochs}", total=len(loader)
+        )
 
+        with tracker:
+            self._epoch_body(
+                loader, optimizer, scheduler, scaler, accumulation, totals, tracker
+            )
+        num_batches = int(totals[3])
+        divisor = max(1, num_batches)
+        return (totals[0] / divisor, totals[1] / divisor, totals[2] / divisor)
+
+    def _epoch_body(
+        self,
+        loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        scaler: torch.amp.GradScaler,
+        accumulation: int,
+        totals: list[float],
+        tracker: ProgressTracker,
+    ) -> None:
+        """Iterate one epoch, accumulating losses and reporting progress.
+
+        Args:
+            loader: Loader over the training split.
+            optimizer: Optimiser to step.
+            scheduler: Learning rate schedule advanced with the optimiser.
+            scaler: Gradient scaler matching the mixed precision policy.
+            accumulation: Micro-batches per optimiser step.
+            totals: Running loss sums and batch count, updated in place.
+            tracker: Progress reporter advanced once per batch.
+        """
+        device = self._device_manager.device
+        pending = 0
         for step, batch in enumerate(loader, start=1):
             if batch is not None:
                 batch = batch.to(device)
@@ -312,8 +349,15 @@ class MultiTaskTrainer:
                 totals[0] += float(losses.total.item())
                 totals[1] += float(losses.ner.item())
                 totals[2] += float(losses.relation.item())
-                num_batches += 1
+                totals[3] += 1.0
                 pending += 1
+
+            seen = max(1.0, totals[3])
+            tracker.advance(
+                loss=totals[0] / seen,
+                ner=totals[1] / seen,
+                re=totals[2] / seen,
+            )
 
             if pending and (step % accumulation == 0 or step == len(loader)):
                 scaler.unscale_(optimizer)
@@ -325,9 +369,6 @@ class MultiTaskTrainer:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 pending = 0
-
-        divisor = max(1, num_batches)
-        return (totals[0] / divisor, totals[1] / divisor, totals[2] / divisor)
 
 
 def _serialisable_config(config: TrainingConfig) -> dict[str, object]:

@@ -9,6 +9,7 @@ from ..schema import LabelSchema
 from .device import DeviceManager
 from .losses import MultiTaskLoss
 from .metrics import EvaluationResult, NerMetric, RelationMetric
+from .progress import ProgressTracker
 
 
 class MultiTaskEvaluator:
@@ -48,7 +49,8 @@ class MultiTaskEvaluator:
         total_loss = 0.0
         num_batches = 0
 
-        for batch in loader:
+        tracker = ProgressTracker("evaluating", total=len(loader))
+        for batch in tracker_wrap(tracker, loader):
             if batch is None:
                 continue
             batch = batch.to(device)
@@ -78,3 +80,19 @@ class MultiTaskEvaluator:
             relation_recall_ceiling=relation_metric.recall_ceiling,
             loss=total_loss / num_batches if num_batches else None,
         )
+
+
+def tracker_wrap(tracker: ProgressTracker, loader):
+    """Iterate a loader while advancing a progress tracker.
+
+    Args:
+        tracker: Progress reporter to advance once per batch.
+        loader: Loader to iterate.
+
+    Yields:
+        Batches from the loader.
+    """
+    with tracker:
+        for batch in loader:
+            yield batch
+            tracker.advance()

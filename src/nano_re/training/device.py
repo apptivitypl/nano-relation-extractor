@@ -15,6 +15,7 @@ only.
 from __future__ import annotations
 
 import contextlib
+import os
 import random
 from dataclasses import dataclass
 from typing import ContextManager
@@ -30,7 +31,8 @@ class DeviceTuning:
     Attributes:
         batch_size: Documents per batch. Larger batches amortise kernel launch
             overhead; on an M4 Pro, moving from four to eight documents cut the
-            time per document from 84 ms to 75 ms.
+            time per document from 84 ms to 75 ms. On CUDA the figure is chosen
+            from the card's memory instead, since that binds first.
         pin_memory: Whether the loader should pin host memory, which speeds the
             copy to a discrete GPU and does nothing on unified memory.
         num_workers: Loader worker processes. Records are parsed in Python on
@@ -159,9 +161,9 @@ class DeviceManager:
                     else torch.float16
                 )
             return DeviceTuning(
-                batch_size=16,
+                batch_size=self._cuda_batch_size(),
                 pin_memory=True,
-                num_workers=4,
+                num_workers=min(8, max(2, (os.cpu_count() or 4) // 2)),
                 autocast_dtype=dtype,
             )
         if self._device.type == "mps":
@@ -174,6 +176,34 @@ class DeviceManager:
         return DeviceTuning(
             batch_size=4, pin_memory=False, num_workers=0, autocast_dtype=None
         )
+
+    @staticmethod
+    def _cuda_batch_size() -> int:
+        """Choose a batch size the card can hold.
+
+        Memory, not throughput, is what bounds the batch here. Requesting the
+        encoder's attention for context pooling materialises one map per layer,
+        which for this architecture is 22 maps of ``batch x heads x S x S``: at
+        512 tokens and a batch of 16 that alone is over two gigabytes, before
+        activations, gradients and optimiser state. Sizing from the card's
+        reported memory avoids an out of memory failure an hour into a run.
+
+        Returns:
+            A batch size appropriate to the visible device.
+        """
+        try:
+            total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            return 8
+        if total >= 40:
+            return 32
+        if total >= 22:
+            return 24
+        if total >= 14:
+            return 16
+        if total >= 10:
+            return 12
+        return 8
 
     @staticmethod
     def _detect_backend() -> str:

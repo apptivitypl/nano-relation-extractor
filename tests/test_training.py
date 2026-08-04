@@ -339,3 +339,36 @@ def test_gradient_scaler_only_enabled_for_float16() -> None:
 
     manager = DeviceManager(preference="cpu")
     assert manager.grad_scaler().is_enabled() is False
+
+
+def test_cuda_batch_size_scales_with_card_memory() -> None:
+    """A small card gets a small batch, since memory binds before throughput."""
+    from nano_re.training.device import DeviceManager
+
+    thresholds = [(8e9, 8), (12e9, 12), (16e9, 16), (24e9, 24), (80e9, 32)]
+    for total, expected in thresholds:
+        class Properties:
+            total_memory = total
+
+        original = torch.cuda.get_device_properties
+        torch.cuda.get_device_properties = lambda index: Properties()
+        try:
+            assert DeviceManager._cuda_batch_size() == expected
+        finally:
+            torch.cuda.get_device_properties = original
+
+
+def test_cuda_batch_size_falls_back_when_the_card_cannot_be_queried() -> None:
+    """An unreadable device yields a conservative batch rather than an error."""
+    from nano_re.training.device import DeviceManager
+
+    original = torch.cuda.get_device_properties
+
+    def explode(index):
+        raise RuntimeError("no device")
+
+    torch.cuda.get_device_properties = explode
+    try:
+        assert DeviceManager._cuda_batch_size() == 8
+    finally:
+        torch.cuda.get_device_properties = original

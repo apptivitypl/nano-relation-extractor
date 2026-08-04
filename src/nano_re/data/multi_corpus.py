@@ -25,6 +25,7 @@ from typing import Callable, Iterator
 
 from torch.utils.data import Dataset
 
+from ..training.progress import ProgressTracker
 from .document import Document
 from .encoder import DocumentEncoder, EncodedDocument
 
@@ -197,6 +198,7 @@ class MultiCorpusDataset(Dataset):
         """
         seen_languages: set[str] = set()
         counters = {"documents": 0, "entities": 0, "relations": 0}
+        tracker = ProgressTracker(f"indexing {spec.name}", total=spec.limit)
 
         def observe(record: dict) -> None:
             document = spec.parser.parse(record, counters["documents"])
@@ -206,10 +208,14 @@ class MultiCorpusDataset(Dataset):
             language = document.metadata.get("language", "")
             if language:
                 seen_languages.add(language)
+            tracker.advance()
 
         builder = getattr(spec.source, "build_index", None)
         if builder is not None and callable(builder):
-            store: object = builder(spec.split, limit=spec.limit, observer=observe)
+            with tracker:
+                store: object = builder(
+                    spec.split, limit=spec.limit, observer=observe
+                )
         else:
             documents = [
                 spec.parser.parse(record, index)
