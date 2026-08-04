@@ -38,7 +38,8 @@ class DeviceTuning:
         num_workers: Loader worker processes. Records are parsed in Python on
             demand, so a discrete GPU benefits from parsing ahead of the device.
         autocast_dtype: Reduced precision to compute in, or ``None`` for float32.
-        device_count: Visible GPUs the batch is spread across.
+        device_count: GPUs visible. Only the first is used; see
+            :meth:`DeviceManager.parallelise`.
         effective_batch_size: Documents per optimiser step. When memory forces a
             smaller batch, gradient accumulation makes up the difference, so the
             optimisation sees the same step size on any card.
@@ -192,19 +193,24 @@ class DeviceManager:
         )
 
     def parallelise(self, model):
-        """Spread the model across every visible GPU, when there is more than one.
+        """Return the model as it will be trained.
+
+        Several GPUs are deliberately not used at once. ``DataParallel``, the
+        only form of parallelism a notebook can launch, replicates the module
+        with its parameters detached from their registration, so a replica's
+        ``parameters()`` is empty. Any model that reads ``self.device`` during
+        the forward pass then fails with a bare ``StopIteration``, which is
+        exactly what the encoder here does. Distributed training does not have
+        that flaw but needs a process launcher, so the honest position is one
+        card used correctly rather than two used briefly.
 
         Args:
             model: The assembled model, already on the device.
 
         Returns:
-            The model, wrapped for data parallelism when that applies.
+            The model, unchanged.
         """
-        if self._tuning.device_count <= 1:
-            return model
-        from ..models import DataParallelAdapter
-
-        return DataParallelAdapter(model, list(range(self._tuning.device_count)))
+        return model
 
     def empty_cache(self) -> None:
         """Release cached device memory, where the backend has a cache."""
@@ -236,7 +242,7 @@ class DeviceManager:
         if name == "cuda" and torch.cuda.is_available():
             name = f"cuda ({torch.cuda.get_device_name(0)})"
             if self._tuning.device_count > 1:
-                name += f" x{self._tuning.device_count}"
+                name += f" (1 of {self._tuning.device_count} used)"
         return f"{name}, {precision}, {self._tuning.num_workers} loader workers"
 
     def _resolve_tuning(self, use_amp: bool) -> DeviceTuning:
@@ -253,12 +259,12 @@ class DeviceManager:
             if use_amp:
                 dtype = (
                     torch.bfloat16
-                    if torch.cuda.is_bf16_supported()
+                    if self._bfloat16_is_native()
                     else torch.float16
                 )
             count = max(1, torch.cuda.device_count())
             return DeviceTuning(
-                batch_size=self._cuda_batch_size() * count,
+                batch_size=self._cuda_batch_size(),
                 pin_memory=True,
                 num_workers=min(8, max(2, (os.cpu_count() or 4) // 2)),
                 autocast_dtype=dtype,
@@ -274,6 +280,24 @@ class DeviceManager:
         return DeviceTuning(
             batch_size=4, pin_memory=False, num_workers=0, autocast_dtype=None
         )
+
+    @staticmethod
+    def _bfloat16_is_native() -> bool:
+        """Test for hardware bfloat16, not merely for its availability.
+
+        ``torch.cuda.is_bf16_supported`` answers yes on Turing, where bfloat16
+        is emulated rather than implemented: a T4 reports support and then runs
+        it slower than float32. Hardware support starts with Ampere, so the
+        compute capability is what decides.
+
+        Returns:
+            Whether the card computes bfloat16 natively.
+        """
+        try:
+            major, _ = torch.cuda.get_device_capability(0)
+        except Exception:
+            return False
+        return major >= 8
 
     @staticmethod
     def _cuda_batch_size() -> int:

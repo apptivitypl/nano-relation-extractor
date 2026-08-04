@@ -161,9 +161,9 @@ then CPU.
 
 | | CUDA | Apple Silicon | CPU |
 | --- | --- | --- | --- |
-| Precision | bfloat16, or float16 with scaling on older cards | float32 | float32 |
-| Batch | from card memory, times the number of cards, then verified | 8 | 4 |
-| Multiple GPUs | batch split across all visible cards | n/a | n/a |
+| Precision | bfloat16 on Ampere and later, float16 with scaling below | float32 | float32 |
+| Batch | from card memory, then verified by a real step | 8 | 4 |
+| Multiple GPUs | first card only, see below | n/a | n/a |
 | Loader workers | half the cores, capped at 8 | 0 | 0 |
 | Pinned memory | yes | no | no |
 | TF32 matmul | enabled | n/a | n/a |
@@ -182,12 +182,18 @@ Gradient accumulation then makes up whatever the batch could not, so a card
 holding eight documents takes the same optimisation step as one holding
 thirty-two, and the learning rate means the same thing on every machine.
 
-More than one visible GPU is used, with the batch split across the cards. This
-is data parallelism, which replicates the model each forward pass and reduces
-gradients on one device, so two cards do not halve the time. Distributed
-training would, but it needs a process launcher that a notebook cannot provide.
-Checkpoints are written from the underlying model, so a bundle trained on two
-cards loads on one.
+Only the first GPU is used, even when several are visible. `DataParallel` is the
+only form of parallelism a notebook can launch, and it replicates a module with
+its parameters detached from their registration, leaving a replica's
+`parameters()` empty. Any model that reads `self.device` during the forward pass
+then fails with a bare `StopIteration`, which is what the encoder here does; it
+was observed on two T4s. Distributed training does not have that flaw but needs
+a process launcher. One card used correctly beats two used briefly.
+
+Precision follows the hardware rather than the API. `torch.cuda.is_bf16_supported`
+answers yes on Turing, where bfloat16 is emulated and runs slower than float32,
+so the compute capability decides instead: bfloat16 from Ampere onward, float16
+with gradient scaling below it.
 
 ### Free GPU
 
@@ -196,11 +202,11 @@ cell, and runs anywhere. Locally it uses the checkout it was started from; on
 Kaggle or Colab it clones the repository and installs what the base image lacks.
 The badges above open it directly.
 
-On Kaggle, set the accelerator and turn internet on before running. **T4 x2** is
-the better choice: Turing has float16 tensor cores that the P100 lacks, so mixed
-precision actually pays there, and both cards are used. The P100 has more memory
-bandwidth but no tensor cores, and float16 on Pascal is often no faster than
-float32. Two of its limits shape the run and both are handled: sessions stop at
+On Kaggle, set the accelerator and turn internet on before running. Choose
+**T4**: Kaggle's PyTorch build ships no kernels for the P100's Pascal
+architecture, so it fails at the first allocation with `no kernel image is
+available`. The detector catches that and says so rather than letting the error
+surface bare. Selecting T4 x2 is fine, but only one card is used. Two of its limits shape the run and both are handled: sessions stop at
 twelve hours, so choose a limit that leaves headroom, and the working directory
 holds about 20 GB, so the caches point at the larger scratch volume and only the
 records the run needs are downloaded.
