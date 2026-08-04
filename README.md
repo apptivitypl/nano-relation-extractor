@@ -144,11 +144,14 @@ fetches a truncated copy of each file over HTTP: `--limit 5000` on Polish
 transfers about 30 MB rather than the 3.3 GB the split weighs, and starts in
 seconds.
 
-| `--limit` | Documents per epoch | Download | On an M4 Pro, 3 epochs |
-| --- | --- | --- | --- |
-| 5000 | ~13k | ~150 MB | ~45 min |
-| 30000 | ~47k | ~900 MB | ~5 h |
-| unset | 5.6M | 33 GB | days |
+| `--limit` | Documents per epoch | Download | 3 epochs, T4 | 3 epochs, M4 Pro |
+| --- | --- | --- | --- | --- |
+| 5000 | 13,053 | ~150 MB | 14 min | ~45 min |
+| 20000 | ~37,000 | ~600 MB | 40 min | ~2 h |
+| 30000 | ~47,000 | ~900 MB | 50 min | ~5 h |
+| unset | 5.6M | 33 GB | days | days |
+
+The T4 column is measured, the M4 Pro column extrapolated from a step timing.
 
 `nano-re all` is an ordinary batch job. It runs the stages in order and exits
 when the last finishes. Progress is reported per batch, with a rate and an
@@ -308,10 +311,19 @@ PyTorch on three differently shaped batches, and export fails if relative
 deviation exceeds tolerance or if the two implementations would ever choose
 different classes.
 
-**Quantisation.** Dynamic INT8 over `MatMul` and `Gather`. It reliably cuts file
-size by about four. It does not reliably cut latency: faster on x86 with VNNI,
-level with float32 on Apple Silicon. The benchmark measures both graphs on your
-hardware and the model card reports what actually happened.
+**Quantisation.** Dynamic INT8, cutting file size by about four. It is applied
+and then checked: several configurations are tried and the first whose
+predictions still agree with float32 on real documents is kept. That check is
+not ceremony. ONNX Runtime's dynamic path pairs unsigned activations with signed
+weights, and on x86 without VNNI the product is accumulated with `VPMADDUBSW`,
+which saturates at sixteen bits; on a Kaggle T4 that collapsed NER F1 from 0.63
+to 0.005 while the file dutifully shrank by 75%. The ladder falls back to
+unsigned weights, then to leaving the embedding table alone, then to a reduced
+range, and if nothing survives the model card says the INT8 graph is unusable
+rather than shipping it as the deployment artifact.
+
+Latency is a separate question and is measured, not assumed: quantisation is
+faster on x86 with VNNI and level with float32 on Apple Silicon.
 
 ## Configuration
 

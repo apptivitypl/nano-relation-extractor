@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from .config import PipelineConfig
-from .data import DataModule
+from .data import DataModule, MultiTaskCollator
 from .export import (
     BenchmarkReport,
     DynamicInt8Quantizer,
@@ -24,6 +24,7 @@ from .export import (
     OnnxExporter,
     OnnxInferenceSession,
     OnnxModelAdapter,
+    build_feeds,
     QuantizationReport,
 )
 from .artifacts import BundleAssembler, BundleReport, ModelCardBuilder
@@ -257,7 +258,7 @@ class Pipeline:
         )
 
         quantization = DynamicInt8Quantizer(self._config.export).quantize(
-            fp32_path, int8_path
+            fp32_path, int8_path, validator=self._build_quantisation_validator(fp32_path)
         )
         self._report(
             f"Quantised {quantization.source_bytes / 1e6:.1f} MB to "
@@ -265,6 +266,17 @@ class Pipeline:
             f"({quantization.size_reduction:.1%} smaller, preprocessing "
             f"{quantization.preprocessing})."
         )
+        if quantization.rejected:
+            discarded = ", ".join(
+                f"{name} ({score:.1%})" for name, score in quantization.rejected
+            )
+            self._report(f"Quantisation rejected: {discarded}.")
+        if not quantization.is_usable:
+            self._report(
+                "Warning: no INT8 configuration preserved the model's "
+                f"predictions (best {quantization.agreement:.1%} agreement). "
+                "Deploy model.onnx instead; the INT8 graph is not usable."
+            )
         artifacts = ExportArtifacts(export=export_report, quantization=quantization)
         artifacts.save(self.artifacts_dir / EXPORT_REPORT_FILENAME)
         return artifacts
@@ -361,9 +373,17 @@ class Pipeline:
         schema = LabelSchema.load(self.artifacts_dir / SCHEMA_FILENAME)
         builder = ModelCardBuilder(
             config=self._config.packaging,
-            corpora=(
-                self._config.data.relation_corpus,
-                self._config.data.entity_corpus,
+            corpora=tuple(
+                name
+                for name, weight in (
+                    (self._config.data.relation_corpus,
+                     self._config.data.relation_weight),
+                    (self._config.data.entity_corpus,
+                     self._config.data.entity_weight),
+                    (self._config.data.english_relation_corpus,
+                     self._config.data.english_relation_weight),
+                )
+                if weight > 0
             ),
         )
         card = builder.build(
@@ -472,6 +492,66 @@ class Pipeline:
                 f"{fitted} to fit available memory."
             )
         return fitted
+
+    def _build_quantisation_validator(self, fp32_path: Path):
+        """Build a check that a quantised graph still predicts what float32 does.
+
+        Agreement is measured on real documents rather than random tensors,
+        because quantisation error concentrates where activations are largest
+        and synthetic input does not put them there.
+
+        Args:
+            fp32_path: The float32 graph to compare against.
+
+        Returns:
+            A callable taking a graph path and returning the fraction of token
+            predictions that match, or ``None`` when no documents are available.
+        """
+        import numpy as np
+
+        module = self.data_module
+        module.set_schema(LabelSchema.load(self.artifacts_dir / SCHEMA_FILENAME))
+        bundle = module.build_corpus(self._config.data.eval_split, training=False)
+        documents = [
+            encoded
+            for encoded in (
+                bundle.dataset[index]
+                for index in range(min(len(bundle.dataset), 16))
+            )
+            if encoded is not None
+        ]
+        if not documents:
+            return None
+
+        collator = MultiTaskCollator(pad_token_id=module.tokenizer.pad_token_id)
+        feeds = [
+            build_feeds(
+                batch.input_ids,
+                batch.attention_mask,
+                batch.mention_mask,
+                batch.pair_index,
+            )
+            for batch in (collator([document]) for document in documents)
+            if batch is not None
+        ]
+        reference = OnnxInferenceSession(fp32_path)
+        expected = [reference.run(payload) for payload in feeds]
+
+        def validate(candidate: Path) -> float:
+            """Return the fraction of predictions matching float32."""
+            session = OnnxInferenceSession(candidate)
+            matched = total = 0
+            for payload, (gold_ner, gold_relation) in zip(feeds, expected):
+                ner, relation = session.run(payload)
+                matched += int((ner.argmax(-1) == gold_ner.argmax(-1)).sum())
+                total += int(np.prod(ner.shape[:-1]))
+                gold_pairs = gold_relation > gold_relation[..., :1]
+                pairs = relation > relation[..., :1]
+                matched += int((pairs == gold_pairs).sum())
+                total += int(gold_pairs.size)
+            return matched / total if total else 1.0
+
+        return validate
 
     def _trim_vocabulary(self, model, module, bundle) -> None:
         """Compact the embedding table to the languages actually in scope.

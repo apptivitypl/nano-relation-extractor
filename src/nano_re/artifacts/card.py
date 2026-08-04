@@ -55,6 +55,9 @@ class ModelCardBuilder:
         Returns:
             The rendered Markdown document.
         """
+        self._bio_width = schema.num_bio_labels
+        self._relation_width = schema.num_relation_labels
+        self._int8_usable = quantization is None or quantization.is_usable
         sections = [
             self._header(training, parameter_count),
             self._contents(),
@@ -120,7 +123,12 @@ class ModelCardBuilder:
                 "`config.json`",
                 "Architecture description needed to rebuild the model",
             ),
-            ("`model_int8.onnx`", "INT8 quantised graph for CPU inference"),
+            (
+                "`model_int8.onnx`",
+                "INT8 quantised graph for CPU inference"
+                if self._int8_usable
+                else "INT8 graph, **not usable**, see CPU performance",
+            ),
         ]
         if self._config.keep_fp32_graph:
             rows.append(
@@ -214,9 +222,16 @@ class ModelCardBuilder:
         if benchmark is None:
             return ""
         threads = "automatic" if benchmark.threads == 0 else str(benchmark.threads)
-        lines = [
-            "## CPU performance",
-            "",
+        lines = ["## CPU performance", ""]
+        if quantization is not None and not quantization.is_usable:
+            lines.extend([
+                "> **The INT8 graph is not usable.** No quantisation "
+                "configuration preserved this model's predictions "
+                f"(best {quantization.agreement:.1%} agreement with float32). "
+                "Deploy `model.onnx` and ignore the size figures below.",
+                "",
+            ])
+        lines.extend([
             "Single document inference through ONNX Runtime on CPU, measured "
             f"over {benchmark.fp32.iterations} iterations across "
             f"{benchmark.documents} documents with {threads} intra-op threads.",
@@ -232,15 +247,29 @@ class ModelCardBuilder:
             "",
             f"Quantisation removes {benchmark.size_reduction:.1%} of the file "
             f"size. {self._latency_verdict(benchmark)}",
-        ]
+        ])
         if quantization is not None:
             lines.append("")
-            lines.append(
-                "Dynamic INT8 quantisation is applied to "
-                f"`{'`, `'.join(quantization.quantized_op_types)}` operators. "
-                "Quantising `Gather` is what shrinks the multilingual embedding "
-                "table, which holds the majority of the parameters."
+            detail = (
+                f"Quantisation used the `{quantization.recipe}` configuration, "
+                f"applied to `{'`, `'.join(quantization.quantized_op_types)}`."
             )
+            if quantization.agreement is not None:
+                detail += (
+                    f" Its predictions agree with float32 on "
+                    f"{quantization.agreement:.1%} of decisions."
+                )
+            if quantization.rejected:
+                discarded = ", ".join(
+                    f"`{name}` ({score:.1%})" for name, score in quantization.rejected
+                )
+                detail += (
+                    f" Configurations tried and rejected: {discarded}. Dynamic "
+                    "quantisation pairs unsigned activations with signed weights, "
+                    "and on x86 without VNNI that product saturates, so the "
+                    "smallest configuration is not always the one that survives."
+                )
+            lines.append(detail)
         delta = benchmark.relation_f1_delta
         ner_delta = benchmark.ner_f1_delta
         if delta is not None and ner_delta is not None:
@@ -320,9 +349,9 @@ class ModelCardBuilder:
             "weights, one row per entity |\n"
             "| `pair_index` | `[B, P, 2]` int64 | Head and tail entity rows per "
             "candidate pair |\n"
-            "| `ner_logits` | `[B, S, 13]` float32 | BIO scores |\n"
-            "| `relation_logits` | `[B, P, 97]` float32 | Relation scores, "
-            "column 0 is the adaptive threshold |\n\n"
+            f"| `ner_logits` | `[B, S, {self._bio_width}]` float32 | BIO scores |\n"
+            f"| `relation_logits` | `[B, P, {self._relation_width}]` float32 | "
+            "Relation scores, column 0 is the adaptive threshold |\n\n"
             "### ONNX Runtime, without this package\n\n"
             "`mention_mask` must be supplied by the caller. Building it from "
             "raw text means decoding the NER output first, which is what the "

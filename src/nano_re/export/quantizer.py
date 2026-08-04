@@ -4,9 +4,20 @@ Dynamic quantisation stores weights as INT8 and computes activation scales at
 run time, which suits variable length text where calibration data would have to
 cover every sequence length.
 
-Quantising ``Gather`` matters more than usual for this model: the multilingual
-vocabulary contributes roughly ninety percent of the parameters, and leaving the
-embedding table in float32 caps the achievable size reduction at a few percent.
+It is an optimisation, so it carries a correctness obligation: a graph that is
+four times smaller and answers differently is not a smaller model, it is a
+broken one. Quantisation here therefore tries several configurations and keeps
+the first whose predictions still agree with float32, rather than applying one
+and reporting the damage afterwards.
+
+The configurations exist because the failure has a documented cause. ONNX
+Runtime's dynamic path pairs unsigned activations with signed weights, and on
+x86 without VNNI that product is accumulated with ``VPMADDUBSW``, which
+saturates at sixteen bits and clamps. The ONNX Runtime documentation names two
+remedies for exactly this, unsigned weights or a reduced range, and both are in
+the ladder below. Quantising ``Gather`` is attempted first because the
+multilingual embedding table is most of the model, but it is also the most
+fragile, so it is the first thing given up.
 """
 
 from __future__ import annotations
@@ -24,6 +35,50 @@ FULL = "full"
 ONNX_SHAPE_ONLY = "onnx_shape_only"
 SKIPPED = "skipped"
 
+DEFAULT_AGREEMENT = 0.98
+
+
+@dataclass(frozen=True)
+class QuantizationRecipe:
+    """One way of quantising, and what it trades away.
+
+    Attributes:
+        name: Short identifier reported in the quantisation report.
+        op_types: Operator types eligible for weight quantisation.
+        weight_type: Integer type weights are stored as.
+        per_channel: Whether each output channel gets its own scale, which
+            helps when weight ranges differ widely between channels.
+        reduce_range: Whether to use seven bits, which avoids the accumulator
+            saturation that afflicts pre-VNNI x86.
+    """
+
+    name: str
+    op_types: tuple[str, ...]
+    weight_type: QuantType
+    per_channel: bool = False
+    reduce_range: bool = False
+
+
+RECIPES: tuple[QuantizationRecipe, ...] = (
+    QuantizationRecipe(
+        "int8-per-channel", ("MatMul", "Gather"), QuantType.QInt8, per_channel=True
+    ),
+    QuantizationRecipe(
+        "uint8-per-channel", ("MatMul", "Gather"), QuantType.QUInt8, per_channel=True
+    ),
+    QuantizationRecipe(
+        "uint8-matmul", ("MatMul",), QuantType.QUInt8, per_channel=True
+    ),
+    QuantizationRecipe(
+        "int8-matmul-reduced",
+        ("MatMul",),
+        QuantType.QInt8,
+        per_channel=True,
+        reduce_range=True,
+    ),
+)
+"""Configurations tried in order, from smallest result to most conservative."""
+
 
 @dataclass(frozen=True)
 class QuantizationReport:
@@ -37,6 +92,10 @@ class QuantizationReport:
         quantized_op_types: Operator types that were eligible for quantisation.
         preprocessing: Which preprocessing stage the graph accepted. One of
             ``full``, ``onnx_shape_only`` or ``skipped``.
+        recipe: Name of the configuration that was kept.
+        agreement: Fraction of predictions matching float32, or ``None`` when
+            no validator was supplied.
+        rejected: Configurations tried and discarded, with their agreement.
     """
 
     source_path: Path
@@ -45,6 +104,14 @@ class QuantizationReport:
     target_bytes: int
     quantized_op_types: tuple[str, ...]
     preprocessing: str
+    recipe: str = "int8"
+    agreement: float | None = None
+    rejected: tuple[tuple[str, float], ...] = ()
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether the quantised graph agrees with float32 well enough to ship."""
+        return self.agreement is None or self.agreement >= DEFAULT_AGREEMENT
 
     @property
     def size_reduction(self) -> float:
@@ -71,6 +138,10 @@ class QuantizationReport:
             "compression_ratio": self.compression_ratio,
             "quantized_op_types": list(self.quantized_op_types),
             "preprocessing": self.preprocessing,
+            "recipe": self.recipe,
+            "agreement": self.agreement,
+            "is_usable": self.is_usable,
+            "rejected": [list(item) for item in self.rejected],
         }
 
     @classmethod
@@ -90,6 +161,16 @@ class QuantizationReport:
             target_bytes=int(payload["target_bytes"]),
             quantized_op_types=tuple(payload["quantized_op_types"]),
             preprocessing=str(payload["preprocessing"]),
+            recipe=str(payload.get("recipe", "int8")),
+            agreement=(
+                float(payload["agreement"])
+                if payload.get("agreement") is not None
+                else None
+            ),
+            rejected=tuple(
+                (str(name), float(score))
+                for name, score in payload.get("rejected", [])
+            ),
         )
 
 
@@ -103,15 +184,24 @@ class DynamicInt8Quantizer:
     def __init__(self, config: ExportConfig) -> None:
         self._config = config
 
-    def quantize(self, source: Path, target: Path) -> QuantizationReport:
-        """Quantise a graph and report the size reduction.
+    def quantize(
+        self, source: Path, target: Path, validator=None
+    ) -> QuantizationReport:
+        """Quantise a graph, keeping the smallest result that still agrees.
+
+        Without a validator the first configuration is applied and trusted,
+        which is what a caller with no data to check against can do. With one,
+        each configuration is measured and the first that clears the agreement
+        threshold wins; the rest are recorded so the report shows what was tried.
 
         Args:
             source: Float32 graph produced by the exporter.
             target: Path of the INT8 graph to write.
+            validator: Optional callable taking a graph path and returning the
+                fraction of predictions matching float32.
 
         Returns:
-            A report describing both files.
+            A report describing both files and which configuration survived.
 
         Raises:
             FileNotFoundError: If the source graph does not exist.
@@ -126,21 +216,105 @@ class DynamicInt8Quantizer:
             prepared = Path(staging) / "prepared.onnx"
             preprocessing = self._preprocess(source, prepared)
             model_input = prepared if preprocessing != SKIPPED else source
-            quantize_dynamic(
-                model_input=str(model_input),
-                model_output=str(target),
-                weight_type=QuantType.QInt8,
-                op_types_to_quantize=list(self._config.quantized_op_types),
-                extra_options={"EnableSubgraph": False},
+
+            rejected: list[tuple[str, float]] = []
+            best: tuple[QuantizationRecipe, float] | None = None
+
+            for recipe in self._recipes():
+                candidate = Path(staging) / f"{recipe.name}.onnx"
+                self._apply(model_input, candidate, recipe)
+                if validator is None:
+                    candidate.replace(target)
+                    return self._report(
+                        source, target, preprocessing, recipe, None, ()
+                    )
+
+                agreement = float(validator(candidate))
+                if agreement >= DEFAULT_AGREEMENT:
+                    candidate.replace(target)
+                    return self._report(
+                        source, target, preprocessing, recipe, agreement,
+                        tuple(rejected),
+                    )
+                rejected.append((recipe.name, agreement))
+                if best is None or agreement > best[1]:
+                    best = (recipe, agreement)
+                    candidate.replace(target)
+
+            recipe, agreement = best
+            return self._report(
+                source, target, preprocessing, recipe, agreement,
+                tuple(item for item in rejected if item[0] != recipe.name),
             )
 
+    def _recipes(self) -> tuple[QuantizationRecipe, ...]:
+        """Return the configurations to try, honouring an explicit override.
+
+        Returns:
+            The ladder, or a single configuration when the operator types were
+            set explicitly.
+        """
+        configured = tuple(self._config.quantized_op_types)
+        if configured and configured != ("MatMul", "Gather"):
+            return (
+                QuantizationRecipe(
+                    "configured", configured, QuantType.QInt8, per_channel=True
+                ),
+            )
+        return RECIPES
+
+    def _apply(
+        self, source: Path, target: Path, recipe: QuantizationRecipe
+    ) -> None:
+        """Run one quantisation configuration.
+
+        Args:
+            source: Preprocessed float32 graph.
+            target: Where to write the quantised graph.
+            recipe: Configuration to apply.
+        """
+        quantize_dynamic(
+            model_input=str(source),
+            model_output=str(target),
+            weight_type=recipe.weight_type,
+            op_types_to_quantize=list(recipe.op_types),
+            per_channel=recipe.per_channel,
+            reduce_range=recipe.reduce_range,
+            extra_options={"EnableSubgraph": False},
+        )
+
+    def _report(
+        self,
+        source: Path,
+        target: Path,
+        preprocessing: str,
+        recipe: QuantizationRecipe,
+        agreement: float | None,
+        rejected: tuple[tuple[str, float], ...],
+    ) -> QuantizationReport:
+        """Assemble the report for a completed quantisation.
+
+        Args:
+            source: Float32 graph.
+            target: Quantised graph.
+            preprocessing: Stage the graph accepted.
+            recipe: Configuration that was kept.
+            agreement: Measured agreement, when a validator ran.
+            rejected: Configurations discarded along the way.
+
+        Returns:
+            The report.
+        """
         return QuantizationReport(
             source_path=source,
             target_path=target,
             source_bytes=source.stat().st_size,
             target_bytes=target.stat().st_size,
-            quantized_op_types=self._config.quantized_op_types,
+            quantized_op_types=recipe.op_types,
             preprocessing=preprocessing,
+            recipe=recipe.name,
+            agreement=agreement,
+            rejected=rejected,
         )
 
     def _preprocess(self, source: Path, prepared: Path) -> str:

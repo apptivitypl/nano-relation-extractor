@@ -562,3 +562,53 @@ def test_an_unreadable_architecture_list_does_not_block_cuda() -> None:
         assert usable and reason == ""
     finally:
         torch.cuda.is_available, torch.cuda.get_arch_list = original
+
+
+def test_quantisation_keeps_the_first_configuration_that_agrees() -> None:
+    """The smallest result that preserves predictions wins.
+
+    Quantisation is an optimisation, so it carries a correctness obligation: a
+    graph four times smaller that answers differently is not a smaller model.
+    """
+    from nano_re.export.quantizer import DEFAULT_AGREEMENT, RECIPES
+
+    assert RECIPES[0].op_types == ("MatMul", "Gather")
+    assert RECIPES[-1].op_types == ("MatMul",)
+    assert DEFAULT_AGREEMENT > 0.9
+
+
+def test_the_ladder_offers_the_documented_remedies_for_saturation() -> None:
+    """Unsigned weights and a reduced range are both reachable.
+
+    ONNX Runtime pairs unsigned activations with signed weights, and on x86
+    without VNNI that product saturates. The documentation names exactly these
+    two remedies, so both must be in the ladder.
+    """
+    from onnxruntime.quantization import QuantType
+    from nano_re.export.quantizer import RECIPES
+
+    assert any(recipe.weight_type == QuantType.QUInt8 for recipe in RECIPES)
+    assert any(recipe.reduce_range for recipe in RECIPES)
+    assert all(recipe.per_channel for recipe in RECIPES)
+
+
+def test_a_report_without_a_validator_is_treated_as_usable() -> None:
+    """A caller with nothing to check against is not told the graph is broken."""
+    from pathlib import Path
+    from nano_re.export.quantizer import QuantizationReport
+
+    report = QuantizationReport(
+        Path("a"), Path("b"), 100, 25, ("MatMul",), "full", "x", None, ()
+    )
+    assert report.is_usable
+
+
+def test_a_collapsed_agreement_marks_the_graph_unusable() -> None:
+    """A graph that disagrees with float32 is reported as such, not shipped quietly."""
+    from pathlib import Path
+    from nano_re.export.quantizer import QuantizationReport
+
+    report = QuantizationReport(
+        Path("a"), Path("b"), 100, 25, ("MatMul",), "full", "x", 0.02, ()
+    )
+    assert not report.is_usable
