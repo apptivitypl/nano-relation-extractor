@@ -446,3 +446,57 @@ def test_relation_tail_is_pruned_by_coverage() -> None:
     assert inventory.to_schema(coverage=1.0).num_relation_labels - 1 == 500
     kept = inventory.to_schema(coverage=0.99).num_relation_labels - 1
     assert 5 <= kept < 500
+
+
+def test_parallel_adapter_returns_the_dataclass_output() -> None:
+    """Parallel execution rebuilds the structured output.
+
+    DataParallel can only gather tensors and standard containers, so the model's
+    dataclass is passed through as a tuple and reassembled. If that were wrong,
+    training on two cards would fail where one card worked.
+    """
+    from nano_re.models.modeling_nano_re import _TupleOutputWrapper
+    from nano_re.config import ModelConfig
+    from nano_re.models import NanoREModelFactory
+    from nano_re.schema import LabelSchema
+
+    schema = LabelSchema.from_relation_info({"P17": "country"})
+    model = NanoREModelFactory().build(
+        ModelConfig(backbone_name="jhu-clsp/mmBERT-small"), schema
+    ).eval()
+    wrapper = _TupleOutputWrapper(model).eval()
+
+    inputs = torch.randint(0, 1000, (1, 8))
+    mention = torch.rand(1, 2, 8)
+    mention = mention / mention.sum(-1, keepdim=True)
+    pairs = torch.tensor([[[0, 1]]])
+
+    with torch.no_grad():
+        tupled = wrapper(inputs, torch.ones_like(inputs), mention, pairs)
+        direct = model(
+            input_ids=inputs,
+            attention_mask=torch.ones_like(inputs),
+            mention_mask=mention,
+            pair_index=pairs,
+        )
+    assert len(tupled) == 3
+    assert torch.allclose(tupled[0], direct.ner_logits)
+    assert torch.allclose(tupled[1], direct.relation_logits)
+
+
+def test_single_device_is_left_unwrapped() -> None:
+    """One GPU needs no parallel wrapper and does not get one."""
+    from nano_re.training.device import DeviceManager
+
+    manager = DeviceManager(preference="cpu")
+    sentinel = object()
+    assert manager.parallelise(sentinel) is sentinel
+
+
+def test_cuda_batch_scales_with_the_number_of_cards() -> None:
+    """Two cards take twice the batch, since each holds its own share."""
+    from nano_re.training.device import DeviceTuning
+
+    single = DeviceTuning(8, True, 4, None, device_count=1)
+    dual = DeviceTuning(16, True, 4, None, device_count=2)
+    assert dual.batch_size == single.batch_size * dual.device_count

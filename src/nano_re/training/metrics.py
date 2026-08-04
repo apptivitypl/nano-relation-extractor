@@ -54,8 +54,54 @@ class ClassificationScore:
         )
 
 
+def decode_bio_spans(tags: list[str]) -> set[tuple[int, int, str]]:
+    """Extract typed spans from a BIO tag sequence.
+
+    A span ends when a tag is ``O``, when a new ``B-`` begins, or when an ``I-``
+    changes type. An ``I-`` with no preceding ``B-`` opens a span rather than
+    being discarded, which is the forgiving reading and matches how the decoder
+    used at inference behaves.
+
+    Args:
+        tags: BIO tag per token.
+
+    Returns:
+        Spans as start, end and type. A set, because span level scoring counts
+        each distinct span once regardless of order.
+    """
+    spans: set[tuple[int, int, str]] = set()
+    start: int | None = None
+    active = ""
+
+    for position, tag in enumerate(tags):
+        prefix, _, entity_type = tag.partition("-")
+        if prefix == "B" or (prefix == "I" and entity_type != active):
+            if start is not None:
+                spans.add((start, position, active))
+            start = position
+            active = entity_type
+        elif prefix not in {"B", "I"}:
+            if start is not None:
+                spans.add((start, position, active))
+            start = None
+            active = ""
+
+    if start is not None:
+        spans.add((start, len(tags), active))
+    return spans
+
+
 class NerMetric:
-    """Span level NER scorer backed by ``evaluate`` and ``seqeval``.
+    """Span level NER scorer.
+
+    Scoring is span level rather than token level: a mention is correct only
+    when its boundaries and type both match, which is what a consumer building
+    nodes from the output actually needs.
+
+    The arithmetic is implemented here rather than delegated. The usual library
+    for it, seqeval, was last released in 2020 and ships no wheel, so installing
+    it runs a setup script that fails on current Python. That is a poor trade for
+    counting set intersections.
 
     Args:
         schema: Label vocabularies used to decode indices into BIO tags.
@@ -64,14 +110,15 @@ class NerMetric:
     def __init__(self, schema: LabelSchema) -> None:
         self._schema = schema
         self._id_to_bio = schema.id_to_bio
-        self._predictions: list[list[str]] = []
-        self._references: list[list[str]] = []
-        self._metric = None
+        self._true_positive = 0
+        self._predicted = 0
+        self._gold = 0
 
     def reset(self) -> None:
         """Discard everything accumulated so far."""
-        self._predictions.clear()
-        self._references.clear()
+        self._true_positive = 0
+        self._predicted = 0
+        self._gold = 0
 
     def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
         """Accumulate one batch of token predictions.
@@ -84,12 +131,15 @@ class NerMetric:
         label_ids = labels.detach().cpu().numpy()
         for row_predictions, row_labels in zip(predicted_ids, label_ids):
             kept = row_labels != -100
-            self._predictions.append(
+            predicted = decode_bio_spans(
                 [self._id_to_bio[int(value)] for value in row_predictions[kept]]
             )
-            self._references.append(
+            gold = decode_bio_spans(
                 [self._id_to_bio[int(value)] for value in row_labels[kept]]
             )
+            self._true_positive += len(predicted & gold)
+            self._predicted += len(predicted)
+            self._gold += len(gold)
 
     def compute(self) -> ClassificationScore:
         """Return the accumulated span level score.
@@ -97,34 +147,21 @@ class NerMetric:
         Returns:
             Micro-averaged precision, recall and F1 over entity spans.
         """
-        if not self._references:
-            return ClassificationScore(0.0, 0.0, 0.0, 0)
-        result = self._seqeval().compute(
-            predictions=self._predictions,
-            references=self._references,
-            zero_division=0,
+        precision = (
+            self._true_positive / self._predicted if self._predicted else 0.0
+        )
+        recall = self._true_positive / self._gold if self._gold else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
         )
         return ClassificationScore(
-            precision=float(result["overall_precision"]),
-            recall=float(result["overall_recall"]),
-            f1=float(result["overall_f1"]),
-            support=sum(len(reference) for reference in self._references),
+            precision=precision,
+            recall=recall,
+            f1=f1,
+            support=self._gold,
         )
-
-    def _seqeval(self):
-        """Load and memoise the seqeval metric implementation.
-
-        The metric builder is fetched on first use rather than at construction
-        so that building a metric object never requires network access.
-
-        Returns:
-            The loaded ``evaluate`` metric.
-        """
-        if self._metric is None:
-            import evaluate
-
-            self._metric = evaluate.load("seqeval")
-        return self._metric
 
 
 class RelationMetric:

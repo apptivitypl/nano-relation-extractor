@@ -8,10 +8,16 @@ from .heads import (
     PairwiseRelationHead,
     TokenClassificationHead,
 )
-from .modeling_nano_re import NanoREArchitecture, NanoREModel, OnnxExportWrapper
+from .modeling_nano_re import (
+    DataParallelAdapter,
+    NanoREArchitecture,
+    NanoREModel,
+    OnnxExportWrapper,
+)
 from .outputs import MultiTaskOutput
 
 __all__ = [
+    "DataParallelAdapter",
     "EncoderBackbone",
     "EntityPooler",
     "LocalizedContextPooler",

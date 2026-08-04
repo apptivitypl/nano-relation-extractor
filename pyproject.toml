@@ -13,7 +13,6 @@ requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.14.0",
     "datasets>=5.0.1",
-    "evaluate>=0.4.6",
     "huggingface-hub>=1.26.0",
     "jupyterlab>=4.6.2",
     "onnx>=1.22.0",
@@ -21,7 +20,6 @@ dependencies = [
     "onnxscript>=0.7.1",
     "optimum>=2.2.0",
     "scikit-learn>=1.9.0",
-    "seqeval>=1.2.2",
     "torch>=2.13.0",
     "transformers>=5.14.1",
 ]

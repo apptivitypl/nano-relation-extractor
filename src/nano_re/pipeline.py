@@ -216,7 +216,7 @@ class Pipeline:
         )
 
         trainer = MultiTaskTrainer(
-            model=model,
+            model=device_manager.parallelise(model),
             criterion=criterion,
             evaluator=MultiTaskEvaluator(schema, criterion, device_manager),
             device_manager=device_manager,

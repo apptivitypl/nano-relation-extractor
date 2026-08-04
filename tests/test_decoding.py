@@ -137,3 +137,44 @@ def test_clusterer_does_not_merge_on_a_shared_suffix() -> None:
         (PredictedMention("Handlowy", 5, 6), "ORG"),
     ]
     assert len(SurfaceFormClusterer().cluster(mentions)) == 2
+
+
+def test_span_scoring_counts_boundaries_and_type_together() -> None:
+    """A mention is correct only when both its extent and its type match."""
+    from nano_re.training.metrics import decode_bio_spans
+
+    assert decode_bio_spans(["B-PER", "I-PER", "O"]) == {(0, 2, "PER")}
+    assert decode_bio_spans(["B-PER", "O", "O"]) != decode_bio_spans(
+        ["B-PER", "I-PER", "O"]
+    )
+    assert decode_bio_spans(["B-ORG", "I-ORG"]) != decode_bio_spans(
+        ["B-PER", "I-PER"]
+    )
+
+
+def test_span_scoring_splits_adjacent_mentions() -> None:
+    """Two neighbouring mentions of one type are two spans, not one."""
+    from nano_re.training.metrics import decode_bio_spans
+
+    assert decode_bio_spans(["B-PER", "B-PER"]) == {(0, 1, "PER"), (1, 2, "PER")}
+
+
+def test_span_scoring_reads_a_stray_inside_tag_as_a_start() -> None:
+    """An I- without a B- opens a span rather than being dropped."""
+    from nano_re.training.metrics import decode_bio_spans
+
+    assert decode_bio_spans(["I-LOC", "O"]) == {(0, 1, "LOC")}
+
+
+def test_span_scoring_closes_a_span_at_the_end_of_the_sequence() -> None:
+    """A mention touching the final token is not lost."""
+    from nano_re.training.metrics import decode_bio_spans
+
+    assert decode_bio_spans(["O", "B-ORG", "I-ORG"]) == {(1, 3, "ORG")}
+
+
+def test_span_scoring_of_an_empty_sequence_is_empty() -> None:
+    """Nothing in, nothing out."""
+    from nano_re.training.metrics import decode_bio_spans
+
+    assert decode_bio_spans([]) == set()

@@ -260,17 +260,29 @@ class MultiTaskTrainer:
                 report.best_evaluation = evaluation
                 best_state = {
                     key: value.detach().cpu().clone()
-                    for key, value in self._model.state_dict().items()
+                    for key, value in self._unwrapped().state_dict().items()
                 }
 
             if self._on_epoch_end is not None:
                 self._on_epoch_end(epoch_report)
 
         if best_state is not None:
-            self._model.load_state_dict(best_state)
-        self._model.to(torch.device("cpu"))
+            self._unwrapped().load_state_dict(best_state)
+        self._unwrapped().to(torch.device("cpu"))
         report.total_seconds = time.perf_counter() - run_start
         return report
+
+    def _unwrapped(self) -> NanoREModel:
+        """Return the model itself, past any parallel wrapper.
+
+        Checkpoints must hold the model's own parameter names, not the names a
+        wrapper introduces, or a bundle trained on two cards would not load on
+        one.
+
+        Returns:
+            The underlying model.
+        """
+        return getattr(self._model, "module", self._model)
 
     def _run_epoch(
         self,

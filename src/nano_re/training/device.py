@@ -38,6 +38,7 @@ class DeviceTuning:
         num_workers: Loader worker processes. Records are parsed in Python on
             demand, so a discrete GPU benefits from parsing ahead of the device.
         autocast_dtype: Reduced precision to compute in, or ``None`` for float32.
+        device_count: Visible GPUs the batch is spread across.
         effective_batch_size: Documents per optimiser step. When memory forces a
             smaller batch, gradient accumulation makes up the difference, so the
             optimisation sees the same step size on any card.
@@ -47,6 +48,7 @@ class DeviceTuning:
     pin_memory: bool
     num_workers: int
     autocast_dtype: torch.dtype | None
+    device_count: int = 1
     effective_batch_size: int = 32
 
 
@@ -179,6 +181,21 @@ class DeviceManager:
             "NANO_RE_LOCALIZED_CONTEXT=false."
         )
 
+    def parallelise(self, model):
+        """Spread the model across every visible GPU, when there is more than one.
+
+        Args:
+            model: The assembled model, already on the device.
+
+        Returns:
+            The model, wrapped for data parallelism when that applies.
+        """
+        if self._tuning.device_count <= 1:
+            return model
+        from ..models import DataParallelAdapter
+
+        return DataParallelAdapter(model, list(range(self._tuning.device_count)))
+
     def empty_cache(self) -> None:
         """Release cached device memory, where the backend has a cache."""
         if self._device.type == "cuda":
@@ -208,6 +225,8 @@ class DeviceManager:
         name = self._device.type
         if name == "cuda" and torch.cuda.is_available():
             name = f"cuda ({torch.cuda.get_device_name(0)})"
+            if self._tuning.device_count > 1:
+                name += f" x{self._tuning.device_count}"
         return f"{name}, {precision}, {self._tuning.num_workers} loader workers"
 
     def _resolve_tuning(self, use_amp: bool) -> DeviceTuning:
@@ -227,11 +246,13 @@ class DeviceManager:
                     if torch.cuda.is_bf16_supported()
                     else torch.float16
                 )
+            count = max(1, torch.cuda.device_count())
             return DeviceTuning(
-                batch_size=self._cuda_batch_size(),
+                batch_size=self._cuda_batch_size() * count,
                 pin_memory=True,
                 num_workers=min(8, max(2, (os.cpu_count() or 4) // 2)),
                 autocast_dtype=dtype,
+                device_count=count,
             )
         if self._device.type == "mps":
             return DeviceTuning(
