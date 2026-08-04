@@ -250,14 +250,22 @@ class RelationInventory:
         languages: tuple[str, ...] = (),
         min_count: int = 1,
         max_relations: int | None = None,
+        coverage: float = 1.0,
     ) -> LabelSchema:
         """Build a label schema from the accumulated inventory.
+
+        The tail of a relation inventory is long and unlearnable. Keeping only
+        the relations that account for a given share of all observed instances
+        cuts it without anyone having to pick a number: the cut adapts to how
+        much data was read and how skewed it turned out to be.
 
         Args:
             languages: Languages the inventory was collected from.
             min_count: Smallest occurrence count kept.
             max_relations: Optional cap keeping only the most frequent
-                relations. ``None`` keeps every relation meeting ``min_count``.
+                relations. ``None`` applies no cap.
+            coverage: Share of observed relation instances the retained classes
+                must account for. ``1.0`` keeps everything.
 
         Returns:
             The resulting :class:`LabelSchema`.
@@ -268,6 +276,16 @@ class RelationInventory:
             if count >= min_count
         ]
         eligible.sort(key=lambda item: (-self._counts[item], item))
+        if coverage < 1.0:
+            total = sum(self._counts[item] for item in eligible)
+            accumulated = 0
+            kept = []
+            for relation_id in eligible:
+                if total and accumulated / total >= coverage:
+                    break
+                kept.append(relation_id)
+                accumulated += self._counts[relation_id]
+            eligible = kept
         if max_relations is not None:
             eligible = eligible[:max_relations]
         return LabelSchema.from_relation_info(

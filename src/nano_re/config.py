@@ -106,7 +106,11 @@ class DataConfig:
         min_relation_count: Smallest number of occurrences for a relation to
             enter the label schema.
         max_relations: Optional cap on the relation inventory, keeping the most
-            frequent. ``None`` keeps every relation meeting the minimum.
+            frequent. ``None`` applies no cap.
+        relation_coverage: Share of observed relation instances the retained
+            classes must account for. The long tail of a relation inventory has
+            too few examples to learn and only dilutes the averaged score, so it
+            is dropped by default. Set to ``1.0`` to keep every relation.
         train_split: Split used for training.
         eval_split: Split used for evaluation.
         max_sequence_length: Maximum number of sub-word tokens per document.
@@ -137,6 +141,7 @@ class DataConfig:
     english_relation_weight: float = 1.0
     min_relation_count: int = 1
     max_relations: int | None = None
+    relation_coverage: float = 0.999
     train_split: str = "train"
     eval_split: str = "dev"
     max_sequence_length: int = 512
@@ -180,6 +185,9 @@ class DataConfig:
                 "NANO_RE_MIN_RELATION_COUNT", cls.min_relation_count
             ),
             max_relations=max_relations if max_relations > 0 else None,
+            relation_coverage=_env_float(
+                "NANO_RE_RELATION_COVERAGE", cls.relation_coverage
+            ),
             train_split=_env_str("NANO_RE_TRAIN_SPLIT", cls.train_split),
             eval_split=_env_str("NANO_RE_EVAL_SPLIT", cls.eval_split),
             max_sequence_length=_env_int(
@@ -269,7 +277,9 @@ class TrainingConfig:
         head_learning_rate: Peak learning rate for the randomly initialised heads.
         weight_decay: Decoupled weight decay for non-bias parameters.
         warmup_ratio: Fraction of total steps spent warming the schedule up.
-        gradient_accumulation_steps: Micro-batches accumulated per optimiser step.
+        gradient_accumulation_steps: Micro-batches accumulated per optimiser
+            step. Zero derives the value that reaches a constant effective batch
+            whatever size the device could hold.
         max_grad_norm: Threshold for gradient-norm clipping.
         ner_loss_weight: Alpha coefficient of the NER loss term.
         relation_loss_weight: Beta coefficient of the relation loss term.
@@ -289,7 +299,7 @@ class TrainingConfig:
     head_learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.06
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 0
     max_grad_norm: float = 1.0
     ner_loss_weight: float = 1.0
     relation_loss_weight: float = 1.0

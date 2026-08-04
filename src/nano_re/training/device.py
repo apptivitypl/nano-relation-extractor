@@ -38,12 +38,16 @@ class DeviceTuning:
         num_workers: Loader worker processes. Records are parsed in Python on
             demand, so a discrete GPU benefits from parsing ahead of the device.
         autocast_dtype: Reduced precision to compute in, or ``None`` for float32.
+        effective_batch_size: Documents per optimiser step. When memory forces a
+            smaller batch, gradient accumulation makes up the difference, so the
+            optimisation sees the same step size on any card.
     """
 
     batch_size: int
     pin_memory: bool
     num_workers: int
     autocast_dtype: torch.dtype | None
+    effective_batch_size: int = 32
 
 
 class DeviceManager:
@@ -116,6 +120,72 @@ class DeviceManager:
         """
         return configured if configured > 0 else self._tuning.batch_size
 
+    def resolve_accumulation(self, configured: int, batch_size: int) -> int:
+        """Choose how many batches to accumulate before stepping.
+
+        A card that can only hold eight documents at a time should still take
+        the same optimisation step as one that holds thirty-two, otherwise the
+        learning rate means something different on every machine. Accumulation
+        makes up whatever the batch size could not.
+
+        Args:
+            configured: Accumulation from configuration. Zero or less asks for
+                the value that reaches the target effective batch.
+            batch_size: Documents actually held per forward pass.
+
+        Returns:
+            Batches to accumulate per optimiser step, at least one.
+        """
+        if configured > 0:
+            return configured
+        target = self._tuning.effective_batch_size
+        return max(1, round(target / max(1, batch_size)))
+
+    def fit_batch_size(self, probe, batch_size: int, minimum: int = 1) -> int:
+        """Shrink the batch until one real step fits in memory.
+
+        An out of memory failure an hour into a run is the worst way to discover
+        a batch was too large, and no static table can predict it: it depends on
+        sequence length, entity count and whether context pooling is on. Trying
+        one step of each candidate size costs seconds and removes the guess.
+
+        Args:
+            probe: Callable taking a batch size and performing one full training
+                step, raising on exhaustion.
+            batch_size: First size to try.
+            minimum: Smallest size worth attempting.
+
+        Returns:
+            The largest size that completed a step.
+
+        Raises:
+            RuntimeError: If even the minimum size cannot run.
+        """
+        candidate = max(minimum, batch_size)
+        while candidate >= minimum:
+            try:
+                probe(candidate)
+                return candidate
+            except (torch.OutOfMemoryError, RuntimeError) as error:
+                if not _is_memory_error(error):
+                    raise
+                self.empty_cache()
+                if candidate == minimum:
+                    break
+                candidate = max(minimum, candidate // 2)
+        raise RuntimeError(
+            f"Could not run a training step even at batch size {minimum}. "
+            "Reduce NANO_RE_MAX_SEQUENCE_LENGTH or set "
+            "NANO_RE_LOCALIZED_CONTEXT=false."
+        )
+
+    def empty_cache(self) -> None:
+        """Release cached device memory, where the backend has a cache."""
+        if self._device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self._device.type == "mps":
+            torch.mps.empty_cache()
+
     def seed_everything(self, seed: int) -> None:
         """Seed Python, NumPy and PyTorch generators.
 
@@ -138,10 +208,7 @@ class DeviceManager:
         name = self._device.type
         if name == "cuda" and torch.cuda.is_available():
             name = f"cuda ({torch.cuda.get_device_name(0)})"
-        return (
-            f"{name}, {precision}, batch {self._tuning.batch_size}, "
-            f"{self._tuning.num_workers} loader workers"
-        )
+        return f"{name}, {precision}, {self._tuning.num_workers} loader workers"
 
     def _resolve_tuning(self, use_amp: bool) -> DeviceTuning:
         """Pick the settings that suit the resolved backend.
@@ -217,3 +284,22 @@ class DeviceManager:
         if torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+
+def _is_memory_error(error: Exception) -> bool:
+    """Test whether an exception reports exhausted device memory.
+
+    Backends spell this differently, and CUDA raises a dedicated type while
+    Apple Silicon raises a generic runtime error, so the message is inspected as
+    well as the type.
+
+    Args:
+        error: The raised exception.
+
+    Returns:
+        ``True`` when the failure was running out of memory.
+    """
+    if isinstance(error, torch.OutOfMemoryError):
+        return True
+    text = str(error).lower()
+    return "out of memory" in text or "insufficient memory" in text

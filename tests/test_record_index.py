@@ -115,3 +115,39 @@ def test_locations_use_slots() -> None:
     """
     location = RecordLocation(path=Path("x"), offset=0)
     assert not hasattr(location, "__dict__")
+
+
+def test_prefix_path_is_distinct_per_limit(tmp_path: Path) -> None:
+    """A truncated copy is cached under a name that states its size.
+
+    Raising the limit must fetch more rather than reuse a shorter copy, and
+    repeating a run must not fetch again.
+    """
+    from nano_re.data.sources import SredfmSource
+
+    source = SredfmSource(languages=("pl",), cache_dir=tmp_path)
+    small = source._prefix_path("train:pl", 100)
+    large = source._prefix_path("train:pl", 5000)
+    assert small != large
+    assert source._prefix_path("train:pl", 100) == small
+    assert str(tmp_path) in str(small)
+
+
+def test_resolve_source_falls_back_to_the_full_download(tmp_path: Path) -> None:
+    """A failed partial fetch does not abort the run.
+
+    Truncated download is an optimisation. If it fails, for any reason, reading
+    the whole file still produces the right answer.
+    """
+    from nano_re.data.sources import SredfmSource
+
+    source = SredfmSource(languages=("pl",), cache_dir=tmp_path)
+    marker = tmp_path / "whole.jsonl"
+    marker.write_text("{}\n", encoding="utf-8")
+
+    def explode(split, limit):
+        raise RuntimeError("network unavailable")
+
+    source.download_prefix = explode
+    source.download = lambda split: marker
+    assert source.resolve_source("train:pl", 100) == marker

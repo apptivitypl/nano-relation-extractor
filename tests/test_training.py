@@ -372,3 +372,77 @@ def test_cuda_batch_size_falls_back_when_the_card_cannot_be_queried() -> None:
         assert DeviceManager._cuda_batch_size() == 8
     finally:
         torch.cuda.get_device_properties = original
+
+
+def test_accumulation_reaches_a_constant_effective_batch() -> None:
+    """A small batch is compensated so the optimiser step is device independent."""
+    from nano_re.training.device import DeviceManager
+
+    manager = DeviceManager(preference="cpu")
+    target = manager.tuning.effective_batch_size
+    for batch in (4, 8, 16, 32):
+        accumulation = manager.resolve_accumulation(0, batch)
+        assert abs(batch * accumulation - target) <= batch // 2
+    assert manager.resolve_accumulation(7, 8) == 7
+
+
+def test_batch_probing_halves_until_a_step_fits() -> None:
+    """Probing shrinks the batch rather than failing an hour into a run."""
+    from nano_re.training.device import DeviceManager
+
+    attempted: list[int] = []
+
+    def probe(size: int) -> None:
+        attempted.append(size)
+        if size > 4:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+    assert DeviceManager(preference="cpu").fit_batch_size(probe, 16) == 4
+    assert attempted == [16, 8, 4]
+
+
+def test_batch_probing_reraises_unrelated_failures() -> None:
+    """A bug in the model is not silently treated as a memory limit."""
+    from nano_re.training.device import DeviceManager
+
+    def probe(size: int) -> None:
+        raise RuntimeError("shape mismatch")
+
+    try:
+        DeviceManager(preference="cpu").fit_batch_size(probe, 8)
+    except RuntimeError as error:
+        assert "shape mismatch" in str(error)
+    else:
+        raise AssertionError("expected the original error")
+
+
+def test_batch_probing_gives_up_with_actionable_advice() -> None:
+    """When nothing fits, the message names what to change."""
+    from nano_re.training.device import DeviceManager
+
+    def probe(size: int) -> None:
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    try:
+        DeviceManager(preference="cpu").fit_batch_size(probe, 8)
+    except RuntimeError as error:
+        assert "NANO_RE_MAX_SEQUENCE_LENGTH" in str(error)
+    else:
+        raise AssertionError("expected a RuntimeError")
+
+
+def test_relation_tail_is_pruned_by_coverage() -> None:
+    """Rare relations are dropped without anyone choosing a threshold."""
+    from nano_re.schema import RelationInventory
+
+    inventory = RelationInventory()
+    for index in range(5):
+        for _ in range(1000):
+            inventory.add(f"P{index}")
+    for index in range(5, 500):
+        inventory.add(f"P{index}")
+
+    assert len(inventory) == 500
+    assert inventory.to_schema(coverage=1.0).num_relation_labels - 1 == 500
+    kept = inventory.to_schema(coverage=0.99).num_relation_labels - 1
+    assert 5 <= kept < 500

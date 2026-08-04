@@ -113,7 +113,7 @@ class MultilingualJsonlSource(JsonlHubSource):
 
         per_language: list[list[RecordLocation]] = []
         for language in self._languages:
-            path = self.download(f"{split}:{language}")
+            path = self.resolve_source(f"{split}:{language}", share)
             found: list[RecordLocation] = []
             for offset, record in scan_json_lines(path, limit=share):
                 if observer is not None:

@@ -97,6 +97,7 @@ class DataModule:
                 languages=self._data_config.languages,
                 min_count=self._data_config.min_relation_count,
                 max_relations=self._data_config.max_relations,
+                coverage=self._data_config.relation_coverage,
             )
         return self._schema
 

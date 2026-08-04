@@ -9,8 +9,10 @@ individually, resumed, or driven cell by cell from a notebook.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+
+import torch
 
 from .config import PipelineConfig
 from .data import DataModule
@@ -193,20 +195,24 @@ class Pipeline:
             relation_weight=self._config.training.relation_loss_weight,
         )
         device_manager = DeviceManager()
-        self._report(f"Device: {device_manager.describe()}.")
         tuning = device_manager.tuning
+        batch_size = self._fit_batch_size(model, criterion, device_manager)
+        accumulation = device_manager.resolve_accumulation(
+            self._config.training.gradient_accumulation_steps, batch_size
+        )
+        self._report(
+            f"Device: {device_manager.describe()}, batch {batch_size} "
+            f"x{accumulation} = {batch_size * accumulation} documents per step."
+        )
+        training_config = replace(
+            self._config.training, gradient_accumulation_steps=accumulation
+        )
 
         train_loader = module.build_loader(
-            train_bundle.dataset,
-            device_manager.resolve_batch_size(self._config.data.train_batch_size),
-            shuffle=True,
-            tuning=tuning,
+            train_bundle.dataset, batch_size, shuffle=True, tuning=tuning
         )
         eval_loader = module.build_loader(
-            eval_bundle.dataset,
-            device_manager.resolve_batch_size(self._config.data.eval_batch_size),
-            shuffle=False,
-            tuning=tuning,
+            eval_bundle.dataset, batch_size, shuffle=False, tuning=tuning
         )
 
         trainer = MultiTaskTrainer(
@@ -214,7 +220,7 @@ class Pipeline:
             criterion=criterion,
             evaluator=MultiTaskEvaluator(schema, criterion, device_manager),
             device_manager=device_manager,
-            config=self._config.training,
+            config=training_config,
             on_epoch_end=self._log_epoch,
         )
         report = trainer.train(train_loader, eval_loader)
@@ -397,6 +403,73 @@ class Pipeline:
             benchmark=benchmark,
             quantization=artifacts.quantization,
         )
+
+    def _fit_batch_size(self, model, criterion, device_manager) -> int:
+        """Find the largest batch that completes one real training step.
+
+        A static table cannot predict this: memory depends on sequence length,
+        how many entities a document has and whether context pooling is on. One
+        probe of each candidate takes seconds and turns an out of memory failure
+        an hour into training into a decision made before it starts.
+
+        Args:
+            model: The assembled model, moved to the device by this method.
+            criterion: Loss used for the probe, so the backward pass is included.
+            device_manager: Resolved device and its tuning.
+
+        Returns:
+            The batch size training will use.
+        """
+        configured = self._config.data.train_batch_size
+        model.to(device_manager.device)
+        if configured > 0:
+            return configured
+
+        sequence = self._config.data.max_sequence_length
+        entities, pairs = 24, 128
+        vocabulary = int(model.backbone.encoder.config.vocab_size)
+
+        def probe(size: int) -> None:
+            """Run one full training step at a candidate batch size."""
+            device = device_manager.device
+            inputs = torch.randint(0, vocabulary, (size, sequence), device=device)
+            mask = torch.ones_like(inputs)
+            mention = torch.rand((size, entities, sequence), device=device)
+            mention = mention / mention.sum(dim=-1, keepdim=True)
+            index = torch.randint(0, entities, (size, pairs, 2), device=device)
+            targets = torch.zeros(
+                (size, pairs, model.architecture.num_relation_labels), device=device
+            )
+            targets[..., 0] = 1.0
+            with device_manager.autocast():
+                outputs = model(
+                    input_ids=inputs,
+                    attention_mask=mask,
+                    mention_mask=mention,
+                    pair_index=index,
+                )
+                losses = criterion(
+                    ner_logits=outputs.ner_logits,
+                    ner_labels=torch.zeros(
+                        (size, sequence), dtype=torch.long, device=device
+                    ),
+                    relation_logits=outputs.relation_logits,
+                    relation_labels=targets,
+                    pair_mask=torch.ones((size, pairs), device=device),
+                )
+            losses.total.backward()
+            model.zero_grad(set_to_none=True)
+
+        fitted = device_manager.fit_batch_size(
+            probe, device_manager.tuning.batch_size
+        )
+        device_manager.empty_cache()
+        if fitted < device_manager.tuning.batch_size:
+            self._report(
+                f"Batch reduced from {device_manager.tuning.batch_size} to "
+                f"{fitted} to fit available memory."
+            )
+        return fitted
 
     def _trim_vocabulary(self, model, module, bundle) -> None:
         """Compact the embedding table to the languages actually in scope.
