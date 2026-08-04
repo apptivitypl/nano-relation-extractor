@@ -218,6 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # nano-relation-extractor pipeline outputs
-artifacts/
+# Anchored to the repository root. An unanchored "artifacts/" also matches
+# src/nano_re/artifacts/, which silently kept a source package out of the repo.
+/artifacts/
 *.onnx
 *.safetensors
