@@ -500,3 +500,82 @@ def test_cuda_batch_scales_with_the_number_of_cards() -> None:
     single = DeviceTuning(8, True, 4, None, device_count=1)
     dual = DeviceTuning(16, True, 4, None, device_count=2)
     assert dual.batch_size == single.batch_size * dual.device_count
+
+
+def test_an_unsupported_card_is_not_selected() -> None:
+    """A visible but unusable GPU is skipped with an explanation.
+
+    Kaggle's PyTorch build dropped kernels for Pascal, so a P100 is visible,
+    reports 16 GB, and then fails at the first allocation with a message that
+    names neither the card nor the cause. Detecting it up front turns hours of
+    confusion into one sentence.
+    """
+    from nano_re.training.device import DeviceManager
+
+    original = (
+        torch.cuda.is_available,
+        torch.cuda.get_device_capability,
+        torch.cuda.get_device_name,
+        torch.cuda.get_arch_list,
+    )
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_device_capability = lambda index=0: (6, 0)
+    torch.cuda.get_device_name = lambda index=0: "Tesla P100-PCIE-16GB"
+    torch.cuda.get_arch_list = lambda: ["sm_70", "sm_75", "sm_80"]
+    try:
+        backend, warning = DeviceManager._detect_backend()
+        assert backend != "cuda"
+        assert "sm_60" in warning and "P100" in warning
+        assert "T4" in warning
+    finally:
+        (
+            torch.cuda.is_available,
+            torch.cuda.get_device_capability,
+            torch.cuda.get_device_name,
+            torch.cuda.get_arch_list,
+        ) = original
+
+
+def test_a_supported_card_is_selected_without_complaint() -> None:
+    """A card the build has kernels for is used silently."""
+    from nano_re.training.device import DeviceManager
+
+    original = (
+        torch.cuda.is_available,
+        torch.cuda.get_device_capability,
+        torch.cuda.get_device_name,
+        torch.cuda.get_arch_list,
+    )
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_device_capability = lambda index=0: (7, 5)
+    torch.cuda.get_device_name = lambda index=0: "Tesla T4"
+    torch.cuda.get_arch_list = lambda: ["sm_70", "sm_75", "sm_80"]
+    try:
+        backend, warning = DeviceManager._detect_backend()
+        assert backend == "cuda"
+        assert warning == ""
+    finally:
+        (
+            torch.cuda.is_available,
+            torch.cuda.get_device_capability,
+            torch.cuda.get_device_name,
+            torch.cuda.get_arch_list,
+        ) = original
+
+
+def test_an_unreadable_architecture_list_does_not_block_cuda() -> None:
+    """When the build reports no architectures, CUDA is not refused.
+
+    Some builds return an empty list. That means the check cannot be made, not
+    that nothing is supported, and refusing on it would disable working GPUs.
+    """
+    from nano_re.training.device import DeviceManager
+
+    original = (torch.cuda.is_available, torch.cuda.get_arch_list)
+    torch.cuda.is_available = lambda: True
+    torch.cuda.get_arch_list = lambda: []
+    try:
+        usable, reason = DeviceManager._cuda_is_usable()
+        assert usable and reason == ""
+    finally:
+        torch.cuda.is_available, torch.cuda.get_arch_list = original

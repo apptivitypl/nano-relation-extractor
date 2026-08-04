@@ -195,6 +195,8 @@ class Pipeline:
             relation_weight=self._config.training.relation_loss_weight,
         )
         device_manager = DeviceManager()
+        if device_manager.warning:
+            self._report(f"Warning: {device_manager.warning}")
         tuning = device_manager.tuning
         batch_size = self._fit_batch_size(model, criterion, device_manager)
         accumulation = device_manager.resolve_accumulation(

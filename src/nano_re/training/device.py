@@ -62,7 +62,12 @@ class DeviceManager:
     """
 
     def __init__(self, preference: str | None = None, use_amp: bool = True) -> None:
-        self._device = torch.device(preference or self._detect_backend())
+        self._warning = ""
+        if preference:
+            self._device = torch.device(preference)
+        else:
+            backend, self._warning = self._detect_backend()
+            self._device = torch.device(backend)
         self._tuning = self._resolve_tuning(use_amp)
         if self._device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -72,6 +77,11 @@ class DeviceManager:
     def device(self) -> torch.device:
         """Device that model and batches are placed on."""
         return self._device
+
+    @property
+    def warning(self) -> str:
+        """Why a present accelerator was not used, empty when none applies."""
+        return self._warning
 
     @property
     def tuning(self) -> DeviceTuning:
@@ -294,17 +304,57 @@ class DeviceManager:
         return 8
 
     @staticmethod
-    def _detect_backend() -> str:
-        """Return the best available backend name.
+    def _detect_backend() -> tuple[str, str]:
+        """Return the best usable backend, and why anything was skipped.
+
+        A card being visible is not the same as being usable. PyTorch ships
+        kernels for a fixed set of architectures, and a build that dropped the
+        one in the machine fails with a bare ``no kernel image is available``
+        error at the first allocation, which says nothing about the cause.
+        Checking the card's compute capability against the build's list turns
+        that into a sentence naming the fix.
 
         Returns:
-            ``cuda``, ``mps`` or ``cpu``.
+            The backend to use, and a warning to report, empty when there is
+            nothing to report.
         """
         if torch.cuda.is_available():
-            return "cuda"
+            usable, reason = DeviceManager._cuda_is_usable()
+            if usable:
+                return "cuda", ""
+            fallback = "mps" if torch.backends.mps.is_available() else "cpu"
+            return fallback, f"{reason} Falling back to {fallback}."
         if torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+            return "mps", ""
+        return "cpu", ""
+
+    @staticmethod
+    def _cuda_is_usable() -> tuple[bool, str]:
+        """Test whether this PyTorch build has kernels for the visible card.
+
+        Returns:
+            Whether CUDA can be used, and an explanation when it cannot.
+        """
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            name = torch.cuda.get_device_name(0)
+            supported = list(torch.cuda.get_arch_list())
+        except Exception:
+            return True, ""
+
+        architectures = [entry for entry in supported if entry.startswith("sm_")]
+        if not architectures:
+            return True, ""
+
+        required = f"sm_{major}{minor}"
+        if required in architectures:
+            return True, ""
+        return False, (
+            f"{name} has compute capability {required}, which this PyTorch build "
+            f"does not support (it has {', '.join(architectures)}). Select a "
+            "newer accelerator, such as a T4, or install a PyTorch build that "
+            "still ships kernels for this card."
+        )
 
 
 def _is_memory_error(error: Exception) -> bool:
